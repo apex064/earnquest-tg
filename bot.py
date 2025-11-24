@@ -2,6 +2,8 @@
 import os
 import logging
 import requests
+import threading
+from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes
 from telegram.ext import filters
@@ -16,6 +18,21 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+
+# Create Flask app for health checks
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return {'status': 'EarnQuest Bot is running!', 'service': 'telegram-bot'}
+
+@app.route('/health')
+def health():
+    return {'status': 'healthy', 'service': 'earnquest-bot'}
+
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    return {'error': 'Webhooks not enabled - using polling'}, 404
 
 class EarnQuestBot:
     def __init__(self):
@@ -572,17 +589,31 @@ Happy earning! 💰
             logger.error(f"Failed to setup Telegram bot handlers: {e}")
             return False
 
-    def run(self):
-        """Run the bot."""
+    def run_bot(self):
+        """Run the bot in a separate thread."""
         if not self.setup_handlers():
             return
         
         logger.info("🤖 Starting Telegram Bot...")
-        
-        # Start the bot with polling
         self.application.run_polling()
 
-# Create and run bot instance
-if __name__ == "__main__":
+def run_flask():
+    """Run Flask app for health checks."""
+    port = int(os.environ.get('PORT', 10000))
+    logger.info(f"🌐 Starting Flask server on port {port}")
+    app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
+
+def main():
+    """Main function to run both bot and web server."""
     bot = EarnQuestBot()
-    bot.run()
+    
+    # Run bot in a separate thread
+    bot_thread = threading.Thread(target=bot.run_bot)
+    bot_thread.daemon = True
+    bot_thread.start()
+    
+    # Run Flask app in main thread (this will keep the service alive)
+    run_flask()
+
+if __name__ == "__main__":
+    main()
