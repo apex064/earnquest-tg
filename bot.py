@@ -577,3 +577,12 @@ Happy earning! 💰
         if not self.setup_handlers():
             return
         
+        logger.info("🤖 Starting Telegram Bot...")
+        
+        # Start the bot with polling
+        self.application.run_polling()
+
+# Create and run bot instance
+if __name__ == "__main__":
+    bot = EarnQuestBot()
+    bot.run()
