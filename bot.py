@@ -3,7 +3,8 @@ import os
 import logging
 import requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Updater, CommandHandler, MessageHandler, CallbackQueryHandler, CallbackContext, Filters
+from telegram.ext import Updater, CommandHandler, MessageHandler, CallbackQueryHandler, CallbackContext
+from telegram.ext import filters  # Updated import
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -552,8 +553,10 @@ Happy earning! 💰
             return False
             
         try:
-            self.updater = Updater(token=self.token, use_context=True)
-            dispatcher = self.updater.dispatcher
+            # Updated to use the new Application class for newer versions
+            from telegram.ext import Application
+            self.application = Application.builder().token(self.token).build()
+            dispatcher = self.application
             
             # Add command handlers
             dispatcher.add_handler(CommandHandler("start", self.start))
@@ -573,8 +576,8 @@ Happy earning! 💰
             # Add callback query handler
             dispatcher.add_handler(CallbackQueryHandler(self.button_handler))
             
-            # Add message handler for login/registration
-            dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, self.handle_message))
+            # Add message handler for login/registration - updated filters usage
+            dispatcher.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
             
             # Add error handler
             dispatcher.add_error_handler(self.error_handler)
@@ -593,8 +596,7 @@ Happy earning! 💰
         logger.info("🤖 Starting Telegram Bot...")
         
         # Start the bot
-        self.updater.start_polling()
-        self.updater.idle()
+        self.application.run_polling()
 
 # Create and run bot instance
 if __name__ == "__main__":
