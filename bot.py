@@ -2,9 +2,7 @@
 import os
 import logging
 import requests
-import asyncio
-from flask import Flask
-from threading import Thread
+from flask import Flask, request
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes
 from telegram.ext import filters
@@ -20,12 +18,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Create Flask app for health checks
+# Create Flask app
 app = Flask(__name__)
-
-@app.route('/health')
-def health_check():
-    return {'status': 'healthy', 'service': 'earnquest-bot'}
 
 class EarnQuestBot:
     def __init__(self):
@@ -58,8 +52,6 @@ class EarnQuestBot:
 
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Send welcome message when the command /start is issued."""
-        user_id = update.effective_user.id
-        
         welcome_text = f"""
 🤖 Welcome to EarnQuest Bot!
 
@@ -103,7 +95,6 @@ Start by logging in with /login or register with /register!
 
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle incoming messages for login/registration."""
-        user_id = update.effective_user.id
         text = update.message.text
         
         if context.user_data.get('awaiting_email'):
@@ -546,20 +537,6 @@ Happy earning! 💰
     async def error_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle errors in the telegram bot."""
         logger.error(f"Exception while handling an update: {context.error}")
-        
-        # Ignore the conflict errors - they're expected during deployment
-        if "Conflict: terminated by other getUpdates request" in str(context.error):
-            logger.info("Another bot instance is running - this is expected during deployment")
-            return
-            
-        try:
-            if update and update.effective_user:
-                await context.bot.send_message(
-                    chat_id=update.effective_user.id,
-                    text="❌ An error occurred. Please try again later or visit our website."
-                )
-        except Exception as e:
-            logger.error(f"Error in error handler: {e}")
 
     def setup_handlers(self):
         """Setup bot handlers."""
@@ -600,33 +577,41 @@ Happy earning! 💰
             logger.error(f"Failed to setup Telegram bot handlers: {e}")
             return False
 
-    async def run_bot(self):
-        """Run the bot asynchronously."""
-        if not self.setup_handlers():
-            return
-        
-        logger.info("🤖 Starting Telegram Bot...")
-        
-        # Start the bot
-        await self.application.run_polling()
+# Create bot instance
+bot = EarnQuestBot()
+bot.setup_handlers()
 
-def run_flask():
-    """Run Flask app for health checks."""
-    port = int(os.environ.get('PORT', 10000))
-    app.run(host='0.0.0.0', port=port, debug=False)
+@app.route('/')
+def home():
+    return {'status': 'EarnQuest Bot is running!', 'service': 'telegram-bot'}
 
-def main():
-    """Main function to run both bot and web server."""
-    bot = EarnQuestBot()
-    
-    # Run bot in a separate thread
-    import threading
-    bot_thread = threading.Thread(target=lambda: asyncio.run(bot.run_bot()))
-    bot_thread.daemon = True
-    bot_thread.start()
-    
-    # Run Flask app in main thread
-    run_flask()
+@app.route('/health')
+def health():
+    return {'status': 'healthy'}
+
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    """Handle incoming updates from Telegram."""
+    if request.headers.get('content-type') == 'application/json':
+        json_string = request.get_data().decode('UTF-8')
+        update = Update.de_json(json_string, bot.application.bot)
+        bot.application.update_queue.put_nowait(update)
+        return 'OK'
+    return 'Bad Request', 400
+
+def set_webhook():
+    """Set webhook for Telegram bot."""
+    webhook_url = f"https://earnquest-telegram-bot.onrender.com/webhook"
+    try:
+        bot.application.bot.set_webhook(webhook_url)
+        logger.info(f"✅ Webhook set to: {webhook_url}")
+    except Exception as e:
+        logger.error(f"❌ Failed to set webhook: {e}")
 
 if __name__ == "__main__":
-    main()
+    # Set webhook on startup
+    set_webhook()
+    
+    # Start Flask app
+    port = int(os.environ.get('PORT', 10000))
+    app.run(host='0.0.0.0', port=port, debug=False)
