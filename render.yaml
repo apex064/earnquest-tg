@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: earnquest-telegram-bot
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: API_BASE_URL
+        value: https://rebackend-ij74.onrender.com/api
