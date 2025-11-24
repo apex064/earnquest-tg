@@ -2,9 +2,10 @@
 import os
 import logging
 import requests
+import asyncio
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Updater, CommandHandler, MessageHandler, CallbackQueryHandler, CallbackContext
-from telegram.ext import filters  # Updated import
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes
+from telegram.ext import filters
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -23,7 +24,7 @@ class EarnQuestBot:
         self.api_base_url = os.environ.get('API_BASE_URL', 'https://rebackend-ij74.onrender.com/api')
         self.website_url = "https://earnquestapp.com/"
         self.user_sessions = {}
-        self.updater = None
+        self.application = None
         
         # Log the API URL for debugging
         logger.info(f"🔧 API Base URL: {self.api_base_url}")
@@ -46,7 +47,7 @@ class EarnQuestBot:
             logger.info(f"   Response Text: {response.text}")
             logger.info(f"   JSON Parse Error: {e}")
 
-    def start(self, update: Update, context: CallbackContext):
+    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Send welcome message when the command /start is issued."""
         user_id = update.effective_user.id
         
@@ -75,23 +76,23 @@ Available Commands:
 Start by logging in with /login or register with /register!
         """
         
-        update.message.reply_text(welcome_text)
+        await update.message.reply_text(welcome_text)
 
-    def login_command(self, update: Update, context: CallbackContext):
+    async def login_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Start login process."""
-        update.message.reply_text("🔐 Please enter your email address to login:")
+        await update.message.reply_text("🔐 Please enter your email address to login:")
         context.user_data['awaiting_email'] = True
 
-    def register_command(self, update: Update, context: CallbackContext):
+    async def register_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Start registration process."""
         keyboard = [
             [InlineKeyboardButton("Register with Email", callback_data="register_email")],
             [InlineKeyboardButton("Cancel", callback_data="cancel")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
-        update.message.reply_text("📝 Let's create your EarnQuest account!", reply_markup=reply_markup)
+        await update.message.reply_text("📝 Let's create your EarnQuest account!", reply_markup=reply_markup)
 
-    def handle_message(self, update: Update, context: CallbackContext):
+    async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle incoming messages for login/registration."""
         user_id = update.effective_user.id
         text = update.message.text
@@ -100,32 +101,32 @@ Start by logging in with /login or register with /register!
             context.user_data['email'] = text
             context.user_data['awaiting_email'] = False
             context.user_data['awaiting_password'] = True
-            update.message.reply_text("🔐 Now please enter your password:")
+            await update.message.reply_text("🔐 Now please enter your password:")
             
         elif context.user_data.get('awaiting_password'):
             email = context.user_data['email']
             password = text
             context.user_data.clear()
-            self.perform_login(update, email, password)
+            await self.perform_login(update, email, password)
             
         elif context.user_data.get('register_awaiting_username'):
             context.user_data['reg_username'] = text
             context.user_data['register_awaiting_username'] = False
             context.user_data['register_awaiting_email'] = True
-            update.message.reply_text("📧 Please enter your email address:")
+            await update.message.reply_text("📧 Please enter your email address:")
             
         elif context.user_data.get('register_awaiting_email'):
             context.user_data['reg_email'] = text
             context.user_data['register_awaiting_email'] = False
             context.user_data['register_awaiting_password'] = True
-            update.message.reply_text("🔐 Please create a password:")
+            await update.message.reply_text("🔐 Please create a password:")
             
         elif context.user_data.get('register_awaiting_password'):
             context.user_data['reg_password'] = text
             context.user_data['register_awaiting_password'] = False
-            self.complete_registration(update, context)
+            await self.complete_registration(update, context)
 
-    def perform_login(self, update: Update, email: str, password: str):
+    async def perform_login(self, update: Update, email: str, password: str):
         """Perform API login."""
         try:
             logger.info(f"🔐 Attempting login for email: {email}")
@@ -151,7 +152,7 @@ Start by logging in with /login or register with /register!
                     }
                 }
                 
-                update.message.reply_text(
+                await update.message.reply_text(
                     f"✅ Login successful! Welcome back, {data.get('username', 'User')}!\n\n"
                     f"Use /balance to check your earnings or visit our website for full features:\n"
                     f"{self.website_url}"
@@ -163,13 +164,13 @@ Start by logging in with /login or register with /register!
                 except:
                     error_msg = f"HTTP {response.status_code}: {response.text}"
                 
-                update.message.reply_text(f"❌ Login failed: {error_msg}")
+                await update.message.reply_text(f"❌ Login failed: {error_msg}")
                 
         except Exception as e:
             logger.error(f"Login error: {e}")
-            update.message.reply_text("❌ Connection error. Please try again later.")
+            await update.message.reply_text("❌ Connection error. Please try again later.")
 
-    def complete_registration(self, update: Update, context: CallbackContext):
+    async def complete_registration(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Complete user registration."""
         try:
             user_data = context.user_data
@@ -191,7 +192,7 @@ Start by logging in with /login or register with /register!
             
             if response.status_code == 201:
                 data = response.json()
-                update.message.reply_text(
+                await update.message.reply_text(
                     f"🎉 Registration successful! Welcome to EarnQuest, {data.get('username')}!\n\n"
                     f"Your account has been created with a $0.10 welcome bonus!\n\n"
                     f"📱 Visit our website to start earning:\n"
@@ -205,35 +206,35 @@ Start by logging in with /login or register with /register!
                 except:
                     error_msg = f"HTTP {response.status_code}: {response.text}"
                     
-                update.message.reply_text(f"❌ Registration failed:\n{error_msg}")
+                await update.message.reply_text(f"❌ Registration failed:\n{error_msg}")
                 
         except Exception as e:
             logger.error(f"Registration error: {e}")
-            update.message.reply_text("❌ Registration failed. Please try again.")
+            await update.message.reply_text("❌ Registration failed. Please try again.")
         
         context.user_data.clear()
 
-    def button_handler(self, update: Update, context: CallbackContext):
+    async def button_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle button callbacks."""
         query = update.callback_query
-        query.answer()
+        await query.answer()
         
         data = query.data
         
         if data == "register_email":
             context.user_data['register_awaiting_username'] = True
-            query.edit_message_text("👤 Please choose a username:")
+            await query.edit_message_text("👤 Please choose a username:")
             
         elif data == "cancel":
             context.user_data.clear()
-            query.edit_message_text("❌ Operation cancelled.")
+            await query.edit_message_text("❌ Operation cancelled.")
 
-    def balance_command(self, update: Update, context: CallbackContext):
+    async def balance_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Check user balance."""
         user_id = update.effective_user.id
         
         if user_id not in self.user_sessions:
-            update.message.reply_text("🔐 Please login first using /login")
+            await update.message.reply_text("🔐 Please login first using /login")
             return
         
         token = self.user_sessions[user_id]['token']
@@ -256,23 +257,23 @@ Start by logging in with /login or register with /register!
                     f"📱 Visit our website for withdrawals and full features:\n"
                     f"{self.website_url}"
                 )
-                update.message.reply_text(message)
+                await update.message.reply_text(message)
             else:
-                update.message.reply_text("❌ Failed to fetch balance. Please try again.")
+                await update.message.reply_text("❌ Failed to fetch balance. Please try again.")
                 
         except Exception as e:
             logger.error(f"Balance error: {e}")
-            update.message.reply_text("❌ Connection error. Please try again later.")
+            await update.message.reply_text("❌ Connection error. Please try again later.")
 
-    def tasks_command(self, update: Update, context: CallbackContext):
+    async def tasks_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show available tasks with website redirect."""
         user_id = update.effective_user.id
         
         if user_id not in self.user_sessions:
-            update.message.reply_text("🔐 Please login first using /login")
+            await update.message.reply_text("🔐 Please login first using /login")
             return
         
-        update.message.reply_text(
+        await update.message.reply_text(
             f"📝 Available Tasks\n\n"
             f"To view and start tasks, please visit our website:\n"
             f"{self.website_url}\n\n"
@@ -285,15 +286,15 @@ Start by logging in with /login or register with /register!
             f"💡 You can complete tasks directly on the website for faster earnings!"
         )
 
-    def withdraw_command(self, update: Update, context: CallbackContext):
+    async def withdraw_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show withdrawal options with website redirect."""
         user_id = update.effective_user.id
         
         if user_id not in self.user_sessions:
-            update.message.reply_text("🔐 Please login first using /login")
+            await update.message.reply_text("🔐 Please login first using /login")
             return
         
-        update.message.reply_text(
+        await update.message.reply_text(
             f"💰 Withdrawal Options\n\n"
             f"To manage withdrawals, please visit our website:\n"
             f"{self.website_url}\n\n"
@@ -306,12 +307,12 @@ Start by logging in with /login or register with /register!
             f"💡 All financial operations are processed through our secure web platform for your safety."
         )
 
-    def referral_command(self, update: Update, context: CallbackContext):
+    async def referral_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show referral information."""
         user_id = update.effective_user.id
         
         if user_id not in self.user_sessions:
-            update.message.reply_text("🔐 Please login first using /login")
+            await update.message.reply_text("🔐 Please login first using /login")
             return
         
         token = self.user_sessions[user_id]['token']
@@ -337,20 +338,20 @@ Start by logging in with /login or register with /register!
                     f"📱 Visit our website for more referral tools:\n"
                     f"{self.website_url}"
                 )
-                update.message.reply_text(message, parse_mode='HTML')
+                await update.message.reply_text(message, parse_mode='HTML')
             else:
-                update.message.reply_text("❌ Failed to fetch referral info.")
+                await update.message.reply_text("❌ Failed to fetch referral info.")
                 
         except Exception as e:
             logger.error(f"Referral error: {e}")
-            update.message.reply_text("❌ Connection error. Please try again.")
+            await update.message.reply_text("❌ Connection error. Please try again.")
 
-    def leaderboard_command(self, update: Update, context: CallbackContext):
+    async def leaderboard_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show leaderboard."""
         user_id = update.effective_user.id
         
         if user_id not in self.user_sessions:
-            update.message.reply_text("🔐 Please login first using /login")
+            await update.message.reply_text("🔐 Please login first using /login")
             return
         
         token = self.user_sessions[user_id]['token']
@@ -370,20 +371,20 @@ Start by logging in with /login or register with /register!
                     message += f"{i}. {username} - ${earnings:.2f}\n"
                 
                 message += f"\n📱 Visit our website for full leaderboard:\n{self.website_url}"
-                update.message.reply_text(message)
+                await update.message.reply_text(message)
             else:
-                update.message.reply_text("❌ Failed to fetch leaderboard.")
+                await update.message.reply_text("❌ Failed to fetch leaderboard.")
                 
         except Exception as e:
             logger.error(f"Leaderboard error: {e}")
-            update.message.reply_text("❌ Connection error. Please try again.")
+            await update.message.reply_text("❌ Connection error. Please try again.")
 
-    def offerwalls_command(self, update: Update, context: CallbackContext):
+    async def offerwalls_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show available offerwalls."""
         user_id = update.effective_user.id
         
         if user_id not in self.user_sessions:
-            update.message.reply_text("🔐 Please login first using /login")
+            await update.message.reply_text("🔐 Please login first using /login")
             return
         
         keyboard = [
@@ -396,19 +397,19 @@ Start by logging in with /login or register with /register!
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
-        update.message.reply_text(
+        await update.message.reply_text(
             "🎯 Available Offerwalls\n\n"
             "Complete surveys and offers to earn money!\n"
             "Choose an offerwall to get started:",
             reply_markup=reply_markup
         )
 
-    def achievements_command(self, update: Update, context: CallbackContext):
+    async def achievements_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show user's achievements."""
         user_id = update.effective_user.id
         
         if user_id not in self.user_sessions:
-            update.message.reply_text("🔐 Please login first using /login")
+            await update.message.reply_text("🔐 Please login first using /login")
             return
         
         token = self.user_sessions[user_id]['token']
@@ -421,7 +422,7 @@ Start by logging in with /login or register with /register!
                 achievements = response.json()
                 
                 if not achievements:
-                    update.message.reply_text(
+                    await update.message.reply_text(
                         "🏆 You haven't unlocked any achievements yet. Complete tasks to earn achievements!\n\n"
                         f"📱 Visit our website to start earning:\n{self.website_url}"
                     )
@@ -434,15 +435,15 @@ Start by logging in with /login or register with /register!
                     message += f"• {title}\n  {description}\n\n"
                 
                 message += f"📱 View all achievements on our website:\n{self.website_url}"
-                update.message.reply_text(message)
+                await update.message.reply_text(message)
             else:
-                update.message.reply_text("❌ Failed to fetch achievements. Please try again.")
+                await update.message.reply_text("❌ Failed to fetch achievements. Please try again.")
                 
         except Exception as e:
             logger.error(f"Achievements error: {e}")
-            update.message.reply_text("❌ Connection error. Please try again.")
+            await update.message.reply_text("❌ Connection error. Please try again.")
 
-    def support_command(self, update: Update, context: CallbackContext):
+    async def support_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show support information."""
         support_text = f"""
 🆘 Support & Help
@@ -466,14 +467,14 @@ If you need assistance, here's how you can get help:
 
 We're here to help you earn more! 💰
         """
-        update.message.reply_text(support_text)
+        await update.message.reply_text(support_text)
 
-    def stats_command(self, update: Update, context: CallbackContext):
+    async def stats_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show user statistics."""
         user_id = update.effective_user.id
         
         if user_id not in self.user_sessions:
-            update.message.reply_text("🔐 Please login first using /login")
+            await update.message.reply_text("🔐 Please login first using /login")
             return
         
         token = self.user_sessions[user_id]['token']
@@ -497,15 +498,15 @@ We're here to help you earn more! 💰
                     f"💰 Referral Earnings: ${data.get('referral_stats', {}).get('earnings', 0):.2f}\n\n"
                     f"📱 Visit our website for detailed analytics:\n{self.website_url}"
                 )
-                update.message.reply_text(message)
+                await update.message.reply_text(message)
             else:
-                update.message.reply_text("❌ Failed to fetch statistics. Please try again.")
+                await update.message.reply_text("❌ Failed to fetch statistics. Please try again.")
                 
         except Exception as e:
             logger.error(f"Stats error: {e}")
-            update.message.reply_text("❌ Connection error. Please try again.")
+            await update.message.reply_text("❌ Connection error. Please try again.")
 
-    def help_command(self, update: Update, context: CallbackContext):
+    async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show help message."""
         help_text = f"""
 🤖 EarnQuest Bot Help
@@ -531,15 +532,15 @@ Need assistance? Use /support to contact our team.
 
 Happy earning! 💰
         """
-        update.message.reply_text(help_text)
+        await update.message.reply_text(help_text)
 
-    def error_handler(self, update: Update, context: CallbackContext):
+    async def error_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle errors in the telegram bot."""
         logger.error(f"Exception while handling an update: {context.error}")
         
         try:
             if update and update.effective_user:
-                context.bot.send_message(
+                await context.bot.send_message(
                     chat_id=update.effective_user.id,
                     text="❌ An error occurred. Please try again later or visit our website."
                 )
@@ -553,34 +554,31 @@ Happy earning! 💰
             return False
             
         try:
-            # Updated to use the new Application class for newer versions
-            from telegram.ext import Application
             self.application = Application.builder().token(self.token).build()
-            dispatcher = self.application
             
             # Add command handlers
-            dispatcher.add_handler(CommandHandler("start", self.start))
-            dispatcher.add_handler(CommandHandler("login", self.login_command))
-            dispatcher.add_handler(CommandHandler("register", self.register_command))
-            dispatcher.add_handler(CommandHandler("balance", self.balance_command))
-            dispatcher.add_handler(CommandHandler("tasks", self.tasks_command))
-            dispatcher.add_handler(CommandHandler("withdraw", self.withdraw_command))
-            dispatcher.add_handler(CommandHandler("referral", self.referral_command))
-            dispatcher.add_handler(CommandHandler("leaderboard", self.leaderboard_command))
-            dispatcher.add_handler(CommandHandler("offerwalls", self.offerwalls_command))
-            dispatcher.add_handler(CommandHandler("achievements", self.achievements_command))
-            dispatcher.add_handler(CommandHandler("support", self.support_command))
-            dispatcher.add_handler(CommandHandler("stats", self.stats_command))
-            dispatcher.add_handler(CommandHandler("help", self.help_command))
+            self.application.add_handler(CommandHandler("start", self.start))
+            self.application.add_handler(CommandHandler("login", self.login_command))
+            self.application.add_handler(CommandHandler("register", self.register_command))
+            self.application.add_handler(CommandHandler("balance", self.balance_command))
+            self.application.add_handler(CommandHandler("tasks", self.tasks_command))
+            self.application.add_handler(CommandHandler("withdraw", self.withdraw_command))
+            self.application.add_handler(CommandHandler("referral", self.referral_command))
+            self.application.add_handler(CommandHandler("leaderboard", self.leaderboard_command))
+            self.application.add_handler(CommandHandler("offerwalls", self.offerwalls_command))
+            self.application.add_handler(CommandHandler("achievements", self.achievements_command))
+            self.application.add_handler(CommandHandler("support", self.support_command))
+            self.application.add_handler(CommandHandler("stats", self.stats_command))
+            self.application.add_handler(CommandHandler("help", self.help_command))
             
             # Add callback query handler
-            dispatcher.add_handler(CallbackQueryHandler(self.button_handler))
+            self.application.add_handler(CallbackQueryHandler(self.button_handler))
             
-            # Add message handler for login/registration - updated filters usage
-            dispatcher.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
+            # Add message handler for login/registration
+            self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
             
             # Add error handler
-            dispatcher.add_error_handler(self.error_handler)
+            self.application.add_error_handler(self.error_handler)
             
             return True
             
