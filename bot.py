@@ -3,6 +3,8 @@ import os
 import logging
 import requests
 import asyncio
+from flask import Flask
+from threading import Thread
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes
 from telegram.ext import filters
@@ -17,6 +19,13 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+
+# Create Flask app for health checks
+app = Flask(__name__)
+
+@app.route('/health')
+def health_check():
+    return {'status': 'healthy', 'service': 'earnquest-bot'}
 
 class EarnQuestBot:
     def __init__(self):
@@ -538,6 +547,11 @@ Happy earning! 💰
         """Handle errors in the telegram bot."""
         logger.error(f"Exception while handling an update: {context.error}")
         
+        # Ignore the conflict errors - they're expected during deployment
+        if "Conflict: terminated by other getUpdates request" in str(context.error):
+            logger.info("Another bot instance is running - this is expected during deployment")
+            return
+            
         try:
             if update and update.effective_user:
                 await context.bot.send_message(
@@ -586,17 +600,33 @@ Happy earning! 💰
             logger.error(f"Failed to setup Telegram bot handlers: {e}")
             return False
 
-    def run(self):
-        """Run the bot."""
+    async def run_bot(self):
+        """Run the bot asynchronously."""
         if not self.setup_handlers():
             return
         
         logger.info("🤖 Starting Telegram Bot...")
         
         # Start the bot
-        self.application.run_polling()
+        await self.application.run_polling()
 
-# Create and run bot instance
-if __name__ == "__main__":
+def run_flask():
+    """Run Flask app for health checks."""
+    port = int(os.environ.get('PORT', 10000))
+    app.run(host='0.0.0.0', port=port, debug=False)
+
+def main():
+    """Main function to run both bot and web server."""
     bot = EarnQuestBot()
-    bot.run()
+    
+    # Run bot in a separate thread
+    import threading
+    bot_thread = threading.Thread(target=lambda: asyncio.run(bot.run_bot()))
+    bot_thread.daemon = True
+    bot_thread.start()
+    
+    # Run Flask app in main thread
+    run_flask()
+
+if __name__ == "__main__":
+    main()
