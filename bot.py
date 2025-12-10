@@ -1,588 +1,1076 @@
 #!/usr/bin/env python
+"""
+EarnQuest Telegram Bot - Full Featured
+======================================
+DUAL MODE:
+- PRIVATE CHAT: Site interface (login, balance, support)
+- GROUP CHAT: Moderator + Announcements
+
+FEATURES:
+- Polls backend for scheduled posts
+- Auto-moderates groups (no links, spam detection)
+- Controlled via Django admin panel
+- Posts photos + text
+- Intelligent support conversations
+"""
+
 import os
+import re
+import json
 import logging
+import asyncio
 import requests
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes
-from telegram.ext import filters
+from datetime import datetime, timedelta
+from typing import Optional, Dict, Any
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatPermissions, InputMediaPhoto
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, CallbackQueryHandler, 
+    ContextTypes, ConversationHandler, filters
+)
+from telegram.constants import ParseMode, ChatMemberStatus, ChatType
+from telegram.error import TelegramError
 from dotenv import load_dotenv
 
-# Load environment variables
 load_dotenv()
 
-# Configure logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
+# Conversation states
+(AWAITING_EMAIL, AWAITING_PASSWORD, AWAITING_REG_USERNAME, AWAITING_REG_EMAIL, 
+ AWAITING_REG_PASSWORD, AWAITING_SUPPORT_MESSAGE, AWAITING_SUPPORT_FOLLOWUP) = range(7)
+
+
 class EarnQuestBot:
     def __init__(self):
         self.token = os.environ.get('TELEGRAM_BOT_TOKEN')
         self.api_base_url = os.environ.get('API_BASE_URL', 'https://rebackend-ij74.onrender.com/api')
-        self.website_url = "https://earnquestapp.com/"
-        self.user_sessions = {}
+        self.bot_api_key = os.environ.get('BOT_API_KEY', '')  # Key for bot to auth with backend
+        self.website_url = "https://earnquestapp.com"
+        self.support_email = "support@earnquestapp.com"
         
-        # Log the API URL for debugging
-        logger.info(f"🔧 API Base URL: {self.api_base_url}")
+        # Group settings
+        self.managed_groups = set()  # Groups where bot is moderator
         
-        if self.token:
-            logger.info(f"✅ Bot token loaded")
-        else:
-            logger.error("❌ TELEGRAM_BOT_TOKEN environment variable not set!")
+        # User sessions
+        self.user_sessions: Dict[int, Dict] = {}
+        
+        # Support conversations
+        self.support_conversations: Dict[int, Dict] = {}
+        
+        # Spam tracking
+        self.message_counts: Dict[int, list] = {}  # user_id -> list of timestamps
+        self.warned_users: Dict[int, int] = {}  # user_id -> warning count
+        
+        # Moderation settings (fetched from backend)
+        self.mod_settings = {
+            'allow_links': False,
+            'allow_forwards': True,
+            'max_messages_per_minute': 5,
+            'mute_duration_minutes': 30,
+            'auto_delete_links': True,
+            'welcome_message': "👋 Welcome to EarnQuest! Earn money completing tasks at {website}",
+            'rules_message': "📜 **Group Rules:**\n1. No spam\n2. No links\n3. Be respectful\n4. English only",
+        }
+        
+        # FAQ responses for intelligent chat
+        self.knowledge_base = {
+            'withdraw': "💰 **Withdrawals** are done on our website: {website}/withdraw\n\nMinimum varies by method. You need $1.00 in qualifying earnings (tasks/surveys - referral & faucet don't count).",
+            'faucet': "🚿 **Faucet** lets you claim free rewards every few minutes!\n\nVisit: {website}/rewards",
+            'referral': "👥 **Referral Program**\n\n• Earn 10% of all your referrals' earnings!\n• Both get $0.10 signup bonus\n\nGet your link: Use /referral or visit {website}/rewards",
+            'task': "📝 **Tasks** are available at {website}/tasks\n\nComplete tasks, submit proof, and earn money!",
+            'survey': "📊 **Surveys** are on our offerwalls: {website}/offerwalls\n\nMultiple providers = more opportunities!",
+            'payment': "💳 We support: PayPal, USDT, Litecoin, Skrill, and more!\n\nCheck methods at: {website}/withdraw",
+            'help': "🆘 Need help?\n\n• Use /support in private chat\n• Email: {email}\n• Visit: {website}/help",
+            'earn': "💵 **Ways to Earn:**\n\n1. Complete tasks\n2. Do surveys\n3. Refer friends (10% commission!)\n4. Daily faucet claims\n5. Bonus codes\n\nStart at: {website}",
+            'minimum': "📊 **Withdrawal Minimum**\n\nYou need $1.00 in qualifying earnings.\n\n⚠️ Referral & faucet earnings don't count!\nOnly tasks, surveys, and offerwalls count.",
+            'balance': "💰 Check your balance:\n\n• Use /balance in private chat\n• Visit: {website}/dashboard",
+            'login': "🔐 To login:\n\n• Use /login in private chat\n• Or visit: {website}/signin",
+            'register': "📝 To register:\n\n• Use /register in private chat\n• Or visit: {website}/register",
+        }
+        
+        logger.info(f"🔧 API: {self.api_base_url}")
+        logger.info(f"✅ Bot token: {'Loaded' if self.token else 'MISSING!'}")
 
-    def debug_api_response(self, response, endpoint_name):
-        """Debug function to print API response details"""
-        logger.info(f"🔍 DEBUG API Response for {endpoint_name}:")
-        logger.info(f"   Status Code: {response.status_code}")
-        logger.info(f"   URL: {response.url}")
+    # ==================== API HELPERS ====================
+    
+    def api_request(self, method: str, endpoint: str, token: str = None, data: dict = None, timeout: int = 15) -> tuple:
+        """Make API request"""
+        headers = {'Content-Type': 'application/json'}
+        if token:
+            headers['Authorization'] = f'Token {token}'
+        if self.bot_api_key:
+            headers['X-Bot-Key'] = self.bot_api_key
+            
+        url = f"{self.api_base_url}/{endpoint.lstrip('/')}"
         
         try:
-            response_data = response.json()
-            logger.info(f"   Response JSON: {response_data}")
+            if method.upper() == 'GET':
+                response = requests.get(url, headers=headers, timeout=timeout)
+            elif method.upper() == 'POST':
+                response = requests.post(url, json=data, headers=headers, timeout=timeout)
+            elif method.upper() == 'PATCH':
+                response = requests.patch(url, json=data, headers=headers, timeout=timeout)
+            else:
+                return None, "Invalid method"
+            return response, None
         except Exception as e:
-            logger.info(f"   Response Text: {response.text}")
-            logger.info(f"   JSON Parse Error: {e}")
+            logger.error(f"API Error: {e}")
+            return None, str(e)
 
-    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Send welcome message when the command /start is issued."""
-        welcome_text = f"""
-🤖 Welcome to EarnQuest Bot!
+    def get_user_token(self, telegram_id: int) -> Optional[str]:
+        """Get user's API token if logged in"""
+        session = self.user_sessions.get(telegram_id)
+        return session.get('token') if session else None
 
-Earn money by completing tasks, surveys, and offers directly through Telegram!
+    # ==================== BACKEND SYNC ====================
+    
+    async def fetch_scheduled_posts(self, context: ContextTypes.DEFAULT_TYPE):
+        """Fetch and execute scheduled posts from backend"""
+        try:
+            response, error = self.api_request('GET', '/bot/scheduled-posts/')
+            
+            if error or not response or response.status_code != 200:
+                return
+            
+            posts = response.json()
+            
+            for post in posts:
+                await self.execute_scheduled_post(context, post)
+                
+        except Exception as e:
+            logger.error(f"Error fetching scheduled posts: {e}")
 
-Available Commands:
-/login - Login to your account
-/register - Create a new account
-/balance - Check your balance
-/tasks - View available tasks
-/withdraw - Request withdrawal
-/referral - Get referral info
-/leaderboard - View top earners
-/offerwalls - Complete surveys and offers
-/achievements - View your achievements
-/stats - View your earning statistics
-/support - Get help and support
-/help - Show this help message
+    async def execute_scheduled_post(self, context: ContextTypes.DEFAULT_TYPE, post: dict):
+        """Execute a scheduled post"""
+        try:
+            post_id = post.get('id')
+            post_type = post.get('post_type')
+            content = post.get('content', '')
+            image_url = post.get('image_url')
+            target_groups = post.get('target_groups', [])
+            
+            # Format content with website URL
+            content = content.replace('{website}', self.website_url)
+            
+            for group_id in target_groups:
+                try:
+                    if image_url:
+                        await context.bot.send_photo(
+                            chat_id=group_id,
+                            photo=image_url,
+                            caption=content,
+                            parse_mode=ParseMode.MARKDOWN
+                        )
+                    else:
+                        await context.bot.send_message(
+                            chat_id=group_id,
+                            text=content,
+                            parse_mode=ParseMode.MARKDOWN
+                        )
+                except Exception as e:
+                    logger.error(f"Failed to post to {group_id}: {e}")
+            
+            # Mark post as executed
+            self.api_request('POST', f'/bot/scheduled-posts/{post_id}/mark-executed/')
+            
+        except Exception as e:
+            logger.error(f"Error executing post: {e}")
 
-📱 Visit our website for full features:
-{self.website_url}
+    async def fetch_mod_settings(self):
+        """Fetch moderation settings from backend"""
+        try:
+            response, error = self.api_request('GET', '/bot/settings/')
+            if response and response.status_code == 200:
+                settings = response.json()
+                self.mod_settings.update(settings)
+                logger.info("✅ Mod settings synced")
+        except Exception as e:
+            logger.error(f"Error fetching settings: {e}")
 
-Start by logging in with /login or register with /register!
-        """
+    async def report_to_backend(self, event_type: str, data: dict):
+        """Report events to backend for logging"""
+        try:
+            self.api_request('POST', '/bot/events/', data={
+                'event_type': event_type,
+                'data': data,
+                'timestamp': datetime.now().isoformat()
+            })
+        except:
+            pass
+
+    # ==================== MODERATION (GROUP MODE) ====================
+    
+    async def moderate_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+        """Moderate group messages. Returns True if message should be deleted."""
+        message = update.effective_message
+        user = update.effective_user
+        chat = update.effective_chat
         
-        await update.message.reply_text(welcome_text)
+        # Only moderate in groups
+        if chat.type not in [ChatType.GROUP, ChatType.SUPERGROUP]:
+            return False
+        
+        # Don't moderate admins
+        try:
+            member = await context.bot.get_chat_member(chat.id, user.id)
+            if member.status in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]:
+                return False
+        except:
+            pass
+        
+        text = message.text or message.caption or ''
+        
+        # Check for links
+        if not self.mod_settings.get('allow_links', False):
+            url_pattern = r'(https?://|www\.|t\.me/|@\w+)'
+            if re.search(url_pattern, text, re.IGNORECASE):
+                try:
+                    await message.delete()
+                    warning = await chat.send_message(
+                        f"⚠️ @{user.username or user.first_name}, links are not allowed!",
+                    )
+                    # Delete warning after 10 seconds
+                    await asyncio.sleep(10)
+                    await warning.delete()
+                except:
+                    pass
+                
+                await self.warn_user_internal(chat.id, user.id, context, "Posting links")
+                return True
+        
+        # Check for spam (too many messages)
+        if await self.check_spam(user.id):
+            try:
+                await message.delete()
+                await self.mute_user_internal(chat.id, user.id, context, 5)  # 5 min mute
+                await chat.send_message(
+                    f"🔇 @{user.username or user.first_name} muted for 5 minutes (spam)"
+                )
+            except:
+                pass
+            return True
+        
+        # Check for forwarded messages (if not allowed)
+        if message.forward_date and not self.mod_settings.get('allow_forwards', True):
+            try:
+                await message.delete()
+            except:
+                pass
+            return True
+        
+        return False
+
+    async def check_spam(self, user_id: int) -> bool:
+        """Check if user is spamming"""
+        now = datetime.now()
+        max_per_minute = self.mod_settings.get('max_messages_per_minute', 5)
+        
+        if user_id not in self.message_counts:
+            self.message_counts[user_id] = []
+        
+        # Clean old timestamps (older than 1 minute)
+        self.message_counts[user_id] = [
+            ts for ts in self.message_counts[user_id]
+            if (now - ts).seconds < 60
+        ]
+        
+        self.message_counts[user_id].append(now)
+        
+        return len(self.message_counts[user_id]) > max_per_minute
+
+    async def warn_user_internal(self, chat_id: int, user_id: int, context, reason: str):
+        """Internal warning system"""
+        if user_id not in self.warned_users:
+            self.warned_users[user_id] = 0
+        
+        self.warned_users[user_id] += 1
+        warnings = self.warned_users[user_id]
+        
+        if warnings >= 3:
+            await self.ban_user_internal(chat_id, user_id, context)
+            await context.bot.send_message(
+                chat_id,
+                f"🚫 User banned after 3 warnings!"
+            )
+            del self.warned_users[user_id]
+        
+        # Report to backend
+        await self.report_to_backend('warning', {
+            'user_id': user_id,
+            'chat_id': chat_id,
+            'reason': reason,
+            'warning_count': warnings
+        })
+
+    async def mute_user_internal(self, chat_id: int, user_id: int, context, minutes: int):
+        """Mute a user"""
+        until = datetime.now() + timedelta(minutes=minutes)
+        try:
+            await context.bot.restrict_chat_member(
+                chat_id,
+                user_id,
+                permissions=ChatPermissions(can_send_messages=False),
+                until_date=until
+            )
+        except Exception as e:
+            logger.error(f"Failed to mute: {e}")
+
+    async def ban_user_internal(self, chat_id: int, user_id: int, context):
+        """Ban a user"""
+        try:
+            await context.bot.ban_chat_member(chat_id, user_id)
+        except Exception as e:
+            logger.error(f"Failed to ban: {e}")
+
+    # ==================== GROUP COMMANDS ====================
+    
+    async def handle_new_member(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Welcome new members"""
+        for member in update.message.new_chat_members:
+            if member.is_bot:
+                continue
+            
+            welcome = self.mod_settings.get('welcome_message', '👋 Welcome!')
+            welcome = welcome.replace('{website}', self.website_url)
+            welcome = welcome.replace('{name}', member.first_name)
+            
+            keyboard = [[InlineKeyboardButton("🌐 Start Earning", url=self.website_url)]]
+            
+            try:
+                msg = await update.effective_chat.send_message(
+                    f"👋 Welcome {member.first_name}!\n\n{welcome}",
+                    reply_markup=InlineKeyboardMarkup(keyboard)
+                )
+                # Delete welcome after 60 seconds to keep chat clean
+                await asyncio.sleep(60)
+                await msg.delete()
+            except:
+                pass
+
+    async def rules_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show group rules"""
+        rules = self.mod_settings.get('rules_message', '📜 Be respectful!')
+        rules = rules.replace('{website}', self.website_url)
+        await update.message.reply_text(rules, parse_mode=ParseMode.MARKDOWN)
+
+    # ==================== INTELLIGENT CHAT (GROUP) ====================
+    
+    async def handle_group_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle messages in groups - moderate + respond intelligently"""
+        message = update.effective_message
+        
+        # First, moderate
+        if await self.moderate_message(update, context):
+            return  # Message was deleted
+        
+        text = (message.text or '').lower()
+        
+        # Check if bot is mentioned or replied to
+        bot_mentioned = False
+        if message.reply_to_message and message.reply_to_message.from_user.id == context.bot.id:
+            bot_mentioned = True
+        if f'@{(await context.bot.get_me()).username}'.lower() in text:
+            bot_mentioned = True
+        
+        if not bot_mentioned:
+            # Check for keywords and respond helpfully
+            for keyword, response in self.knowledge_base.items():
+                if keyword in text and ('?' in text or 'how' in text or 'what' in text or 'where' in text):
+                    formatted = response.format(website=self.website_url, email=self.support_email)
+                    await message.reply_text(formatted, parse_mode=ParseMode.MARKDOWN)
+                    return
+            return
+        
+        # Bot was mentioned - provide help
+        await self.intelligent_response(update, context, text)
+
+    async def intelligent_response(self, update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
+        """Generate intelligent response based on user query"""
+        message = update.effective_message
+        
+        # Find best matching response
+        best_match = None
+        best_score = 0
+        
+        keywords_map = {
+            'withdraw': ['withdraw', 'payout', 'cash out', 'payment', 'get money', 'get paid'],
+            'faucet': ['faucet', 'free', 'claim'],
+            'referral': ['referral', 'refer', 'invite', 'friend', 'commission'],
+            'task': ['task', 'job', 'work', 'complete'],
+            'survey': ['survey', 'offerwall', 'offer'],
+            'payment': ['paypal', 'usdt', 'crypto', 'litecoin', 'skrill'],
+            'help': ['help', 'support', 'problem', 'issue', 'contact'],
+            'earn': ['earn', 'money', 'make money', 'how to', 'start'],
+            'minimum': ['minimum', 'min', 'requirement', 'need', 'qualifying'],
+            'balance': ['balance', 'check', 'how much'],
+            'login': ['login', 'sign in', 'log in', 'access'],
+            'register': ['register', 'sign up', 'create account', 'join'],
+        }
+        
+        for key, keywords in keywords_map.items():
+            score = sum(1 for kw in keywords if kw in text)
+            if score > best_score:
+                best_score = score
+                best_match = key
+        
+        if best_match and best_match in self.knowledge_base:
+            response = self.knowledge_base[best_match]
+            formatted = response.format(website=self.website_url, email=self.support_email)
+            await message.reply_text(formatted, parse_mode=ParseMode.MARKDOWN)
+        else:
+            # Default response
+            await message.reply_text(
+                f"🤖 Hi! I can help with:\n\n"
+                f"• /balance - Check your balance\n"
+                f"• /referral - Get referral link\n"
+                f"• /support - Get help\n\n"
+                f"Or ask me about: withdrawals, tasks, surveys, referrals, faucet\n\n"
+                f"🌐 Full features at: {self.website_url}",
+                parse_mode=ParseMode.MARKDOWN
+            )
+
+    # ==================== PRIVATE CHAT COMMANDS ====================
+    
+    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Start command - different for private vs group"""
+        chat = update.effective_chat
+        user = update.effective_user
+        
+        if chat.type in [ChatType.GROUP, ChatType.SUPERGROUP]:
+            # Group - show brief info
+            await update.message.reply_text(
+                f"🤖 **EarnQuest Bot**\n\n"
+                f"I'm here to help and keep this group clean!\n\n"
+                f"🌐 Start earning: {self.website_url}\n"
+                f"💬 DM me for account features",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        
+        # Private chat - full menu
+        keyboard = [
+            [InlineKeyboardButton("🔐 Login", callback_data="start_login"),
+             InlineKeyboardButton("📝 Register", callback_data="start_register")],
+            [InlineKeyboardButton("💰 Balance", callback_data="cmd_balance"),
+             InlineKeyboardButton("📊 Stats", callback_data="cmd_stats")],
+            [InlineKeyboardButton("👥 Referral", callback_data="cmd_referral"),
+             InlineKeyboardButton("🏆 Leaderboard", callback_data="cmd_leaderboard")],
+            [InlineKeyboardButton("🆘 Support", callback_data="cmd_support"),
+             InlineKeyboardButton("❓ FAQ", callback_data="cmd_faq")],
+            [InlineKeyboardButton("🌐 Visit Website", url=self.website_url)],
+        ]
+        
+        welcome = f"""
+🎉 **Welcome to EarnQuest, {user.first_name}!**
+
+Earn money by completing tasks, surveys, and offers!
+
+**Quick Actions:**
+• Login to check your balance
+• Get your referral link
+• Contact support
+
+**Website Features:**
+💸 Withdrawals
+🚿 Faucet
+📝 Tasks & Surveys
+
+_Tap a button below to get started!_
+"""
+        
+        await update.message.reply_text(
+            welcome,
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
 
     async def login_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Start login process."""
-        await update.message.reply_text("🔐 Please enter your email address to login:")
-        context.user_data['awaiting_email'] = True
-
-    async def register_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Start registration process."""
-        keyboard = [
-            [InlineKeyboardButton("Register with Email", callback_data="register_email")],
-            [InlineKeyboardButton("Cancel", callback_data="cancel")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await update.message.reply_text("📝 Let's create your EarnQuest account!", reply_markup=reply_markup)
-
-    async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle incoming messages for login/registration."""
-        text = update.message.text
+        """Start login process"""
+        if update.effective_chat.type != ChatType.PRIVATE:
+            await update.message.reply_text("🔐 Please login in private chat: @EarnQuestBot")
+            return ConversationHandler.END
         
-        if context.user_data.get('awaiting_email'):
-            context.user_data['email'] = text
-            context.user_data['awaiting_email'] = False
-            context.user_data['awaiting_password'] = True
-            await update.message.reply_text("🔐 Now please enter your password:")
-            
-        elif context.user_data.get('awaiting_password'):
-            email = context.user_data['email']
-            password = text
+        await update.message.reply_text(
+            "📧 **Login to EarnQuest**\n\nPlease enter your email address:",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return AWAITING_EMAIL
+
+    async def receive_email(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Receive email"""
+        email = update.message.text.strip()
+        
+        if not re.match(r'^[\w\.-]+@[\w\.-]+\.\w+$', email):
+            await update.message.reply_text("❌ Invalid email. Please try again:")
+            return AWAITING_EMAIL
+        
+        context.user_data['login_email'] = email
+        await update.message.reply_text("🔐 Now enter your password:")
+        return AWAITING_PASSWORD
+
+    async def receive_password(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Complete login"""
+        password = update.message.text
+        email = context.user_data.get('login_email')
+        
+        # Delete password message
+        try:
+            await update.message.delete()
+        except:
+            pass
+        
+        status_msg = await update.effective_chat.send_message("🔄 Logging in...")
+        
+        response, error = self.api_request('POST', '/auth/login/', data={
+            'email': email,
+            'password': password
+        })
+        
+        if error:
+            await status_msg.edit_text(f"❌ Connection error. Please try again later.")
             context.user_data.clear()
-            await self.perform_login(update, email, password)
-            
-        elif context.user_data.get('register_awaiting_username'):
-            context.user_data['reg_username'] = text
-            context.user_data['register_awaiting_username'] = False
-            context.user_data['register_awaiting_email'] = True
-            await update.message.reply_text("📧 Please enter your email address:")
-            
-        elif context.user_data.get('register_awaiting_email'):
-            context.user_data['reg_email'] = text
-            context.user_data['register_awaiting_email'] = False
-            context.user_data['register_awaiting_password'] = True
-            await update.message.reply_text("🔐 Please create a password:")
-            
-        elif context.user_data.get('register_awaiting_password'):
-            context.user_data['reg_password'] = text
-            context.user_data['register_awaiting_password'] = False
-            await self.complete_registration(update, context)
-
-    async def perform_login(self, update: Update, email: str, password: str):
-        """Perform API login."""
-        try:
-            logger.info(f"🔐 Attempting login for email: {email}")
-            
-            response = requests.post(
-                f"{self.api_base_url}/auth/login/",
-                json={'email': email, 'password': password},
-                timeout=10
-            )
-            
-            self.debug_api_response(response, "Login")
-            
-            if response.status_code == 200:
-                data = response.json()
-                token = data.get('token')
-                user_id = update.effective_user.id
-                
-                self.user_sessions[user_id] = {
-                    'token': token,
-                    'user_data': {
-                        'user_id': data.get('user_id'),
-                        'username': data.get('username')
-                    }
-                }
-                
-                await update.message.reply_text(
-                    f"✅ Login successful! Welcome back, {data.get('username', 'User')}!\n\n"
-                    f"Use /balance to check your earnings or visit our website for full features:\n"
-                    f"{self.website_url}"
-                )
-            else:
-                try:
-                    error_data = response.json()
-                    error_msg = error_data.get('error', 'Login failed')
-                except:
-                    error_msg = f"HTTP {response.status_code}: {response.text}"
-                
-                await update.message.reply_text(f"❌ Login failed: {error_msg}")
-                
-        except Exception as e:
-            logger.error(f"Login error: {e}")
-            await update.message.reply_text("❌ Connection error. Please try again later.")
-
-    async def complete_registration(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Complete user registration."""
-        try:
-            user_data = context.user_data
-            payload = {
-                'username': user_data['reg_username'],
-                'email': user_data['reg_email'],
-                'password': user_data['reg_password'],
-                'confirm_password': user_data['reg_password'],
-                'agree_to_terms': True
+            return ConversationHandler.END
+        
+        if response.status_code == 200:
+            data = response.json()
+            self.user_sessions[update.effective_user.id] = {
+                'token': data.get('token'),
+                'username': data.get('username'),
+                'user_id': data.get('user_id'),
+                'email': email
             }
             
-            response = requests.post(
-                f"{self.api_base_url}/auth/register/",
-                json=payload,
-                timeout=10
+            await status_msg.edit_text(
+                f"✅ **Welcome back, {data.get('username')}!**\n\n"
+                f"Use /balance to check your earnings\n"
+                f"Use /referral to get your referral link\n"
+                f"Use /support if you need help",
+                parse_mode=ParseMode.MARKDOWN
             )
-            
-            self.debug_api_response(response, "Registration")
-            
-            if response.status_code == 201:
-                data = response.json()
-                await update.message.reply_text(
-                    f"🎉 Registration successful! Welcome to EarnQuest, {data.get('username')}!\n\n"
-                    f"Your account has been created with a $0.10 welcome bonus!\n\n"
-                    f"📱 Visit our website to start earning:\n"
-                    f"{self.website_url}\n\n"
-                    f"Use /login to access your account through Telegram."
-                )
-            else:
-                try:
-                    errors = response.json().get('errors', {})
-                    error_msg = "\n".join([f"• {error}" for error in errors.values()])
-                except:
-                    error_msg = f"HTTP {response.status_code}: {response.text}"
-                    
-                await update.message.reply_text(f"❌ Registration failed:\n{error_msg}")
-                
-        except Exception as e:
-            logger.error(f"Registration error: {e}")
-            await update.message.reply_text("❌ Registration failed. Please try again.")
+        else:
+            try:
+                error_msg = response.json().get('error', 'Invalid credentials')
+            except:
+                error_msg = 'Login failed'
+            await status_msg.edit_text(f"❌ {error_msg}")
         
         context.user_data.clear()
+        return ConversationHandler.END
 
+    async def register_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Start registration"""
+        if update.effective_chat.type != ChatType.PRIVATE:
+            await update.message.reply_text("📝 Please register in private chat: @EarnQuestBot")
+            return ConversationHandler.END
+        
+        await update.message.reply_text(
+            "📝 **Create your EarnQuest account!**\n\n"
+            "Choose a username (letters, numbers, underscores):",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return AWAITING_REG_USERNAME
+
+    async def receive_reg_username(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        username = update.message.text.strip()
+        if len(username) < 3 or not re.match(r'^[\w]+$', username):
+            await update.message.reply_text("❌ Invalid username. Min 3 chars, letters/numbers/underscores:")
+            return AWAITING_REG_USERNAME
+        
+        context.user_data['reg_username'] = username
+        await update.message.reply_text("📧 Enter your email address:")
+        return AWAITING_REG_EMAIL
+
+    async def receive_reg_email(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        email = update.message.text.strip()
+        if not re.match(r'^[\w\.-]+@[\w\.-]+\.\w+$', email):
+            await update.message.reply_text("❌ Invalid email. Please try again:")
+            return AWAITING_REG_EMAIL
+        
+        context.user_data['reg_email'] = email
+        await update.message.reply_text("🔐 Create a password (min 6 characters):")
+        return AWAITING_REG_PASSWORD
+
+    async def receive_reg_password(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        password = update.message.text
+        
+        try:
+            await update.message.delete()
+        except:
+            pass
+        
+        if len(password) < 6:
+            await update.effective_chat.send_message("❌ Password too short. Min 6 characters:")
+            return AWAITING_REG_PASSWORD
+        
+        status_msg = await update.effective_chat.send_message("🔄 Creating account...")
+        
+        response, error = self.api_request('POST', '/auth/register/', data={
+            'username': context.user_data['reg_username'],
+            'email': context.user_data['reg_email'],
+            'password': password,
+            'confirm_password': password,
+            'agree_to_terms': True
+        })
+        
+        if error:
+            await status_msg.edit_text(f"❌ Connection error. Please try later.")
+            context.user_data.clear()
+            return ConversationHandler.END
+        
+        if response.status_code == 201:
+            data = response.json()
+            await status_msg.edit_text(
+                f"🎉 **Welcome to EarnQuest, {data.get('username')}!**\n\n"
+                f"💰 You received a **$0.10 welcome bonus!**\n\n"
+                f"📧 Check your email to verify your account.\n\n"
+                f"Use /login to access your account.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+        else:
+            try:
+                errors = response.json()
+                error_text = str(errors)
+            except:
+                error_text = 'Registration failed'
+            await status_msg.edit_text(f"❌ {error_text}")
+        
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    async def cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        context.user_data.clear()
+        await update.message.reply_text("❌ Cancelled.")
+        return ConversationHandler.END
+
+    # ==================== USER FEATURE COMMANDS ====================
+    
+    async def balance_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Check balance"""
+        user_id = update.effective_user.id
+        token = self.get_user_token(user_id)
+        
+        if not token:
+            await update.message.reply_text("🔐 Please /login first!")
+            return
+        
+        response, error = self.api_request('GET', '/profile/', token=token)
+        
+        if error or response.status_code != 200:
+            await update.message.reply_text("❌ Failed to fetch balance. Try /login again.")
+            return
+        
+        data = response.json()
+        withdrawal_info = data.get('withdrawal_info', {})
+        can_withdraw = withdrawal_info.get('can_withdraw', False)
+        remaining = withdrawal_info.get('remaining_to_unlock', 0)
+        
+        status = "✅ Ready to withdraw!" if can_withdraw else f"⏳ Need ${remaining:.2f} more qualifying earnings"
+        
+        await update.message.reply_text(
+            f"💰 **Your Balance**\n\n"
+            f"**Balance:** ${float(data.get('current_balance', 0)):.2f}\n"
+            f"**Total Earned:** ${float(data.get('total_earned', 0)):.2f}\n"
+            f"**Qualifying:** ${float(data.get('qualifying_earnings', 0)):.2f}\n"
+            f"**Referral Earnings:** ${float(data.get('referral_earnings', 0)):.2f}\n"
+            f"**Level:** {data.get('level', 'Bronze')}\n\n"
+            f"**Withdrawal:** {status}\n\n"
+            f"🌐 Withdraw at: {self.website_url}/withdraw",
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+    async def stats_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show stats"""
+        user_id = update.effective_user.id
+        token = self.get_user_token(user_id)
+        
+        if not token:
+            await update.message.reply_text("🔐 Please /login first!")
+            return
+        
+        response, error = self.api_request('GET', '/dashboard/stats/', token=token)
+        
+        if error or response.status_code != 200:
+            await update.message.reply_text("❌ Failed to fetch stats.")
+            return
+        
+        data = response.json()
+        ref = data.get('referral_stats', {})
+        
+        await update.message.reply_text(
+            f"📊 **Your Statistics**\n\n"
+            f"💵 Balance: ${data.get('balance', 0):.2f}\n"
+            f"💰 Total Earned: ${data.get('total_earned', 0):.2f}\n"
+            f"📈 Today: ${data.get('today_earnings', 0):.2f}\n"
+            f"✅ Tasks: {data.get('total_tasks', 0)}\n"
+            f"🔥 Streak: {data.get('streak_days', 0)} days\n"
+            f"👥 Referrals: {ref.get('total_referrals', 0)}\n"
+            f"💎 Ref Earnings: ${ref.get('earnings', 0):.2f}\n\n"
+            f"🌐 {self.website_url}/dashboard",
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+    async def referral_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show referral info"""
+        user_id = update.effective_user.id
+        token = self.get_user_token(user_id)
+        
+        if not token:
+            await update.message.reply_text("🔐 Please /login first!")
+            return
+        
+        response, error = self.api_request('GET', '/my-referral-info/', token=token)
+        
+        if error or response.status_code != 200:
+            await update.message.reply_text("❌ Failed to fetch referral info.")
+            return
+        
+        data = response.json()
+        
+        await update.message.reply_text(
+            f"👥 **Your Referral Program**\n\n"
+            f"📋 Code: `{data.get('referral_code', 'N/A')}`\n\n"
+            f"🔗 Link:\n{data.get('referral_url', 'N/A')}\n\n"
+            f"📊 **Stats:**\n"
+            f"• Referrals: {data.get('total_referrals', 0)}\n"
+            f"• Earnings: ${data.get('referral_earnings', 0):.2f}\n\n"
+            f"💰 **Earn 10% of all your referrals' earnings!**",
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+    async def leaderboard_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show leaderboard"""
+        user_id = update.effective_user.id
+        token = self.get_user_token(user_id)
+        
+        if not token:
+            await update.message.reply_text("🔐 Please /login first!")
+            return
+        
+        response, error = self.api_request('GET', '/leaderboard/top-earners/', token=token)
+        
+        if error or response.status_code != 200:
+            await update.message.reply_text("❌ Failed to fetch leaderboard.")
+            return
+        
+        data = response.json()
+        top = data.get('top_earners', [])[:10]
+        
+        medals = ['🥇', '🥈', '🥉'] + ['🏅'] * 7
+        
+        msg = "🏆 **Top Earners**\n\n"
+        for i, user in enumerate(top):
+            msg += f"{medals[i]} {user.get('username')} - ${user.get('earnings', 0):.2f}\n"
+        
+        msg += f"\n🌐 {self.website_url}/leaderboard"
+        await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+
+    # ==================== SUPPORT SYSTEM ====================
+    
+    async def support_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Start support conversation"""
+        if update.effective_chat.type != ChatType.PRIVATE:
+            await update.message.reply_text("🆘 For support, please DM me: @EarnQuestBot")
+            return ConversationHandler.END
+        
+        keyboard = [
+            [InlineKeyboardButton("💰 Withdrawal Issue", callback_data="support_withdrawal")],
+            [InlineKeyboardButton("📝 Task Problem", callback_data="support_task")],
+            [InlineKeyboardButton("🔐 Account Issue", callback_data="support_account")],
+            [InlineKeyboardButton("🐛 Bug Report", callback_data="support_bug")],
+            [InlineKeyboardButton("❓ Other", callback_data="support_other")],
+        ]
+        
+        await update.message.reply_text(
+            "🆘 **EarnQuest Support**\n\n"
+            "What do you need help with?",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return AWAITING_SUPPORT_MESSAGE
+
+    async def receive_support_category(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle support category selection"""
+        query = update.callback_query
+        await query.answer()
+        
+        category = query.data.replace('support_', '')
+        context.user_data['support_category'] = category
+        
+        await query.edit_message_text(
+            f"📝 **Support - {category.title()}**\n\n"
+            f"Please describe your issue in detail:\n"
+            f"• What were you trying to do?\n"
+            f"• What happened?\n"
+            f"• Any error messages?\n\n"
+            f"Type /cancel to exit.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return AWAITING_SUPPORT_MESSAGE
+
+    async def receive_support_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Receive support message and create ticket"""
+        message = update.message.text
+        user = update.effective_user
+        category = context.user_data.get('support_category', 'general')
+        
+        # Get session info
+        session = self.user_sessions.get(user.id, {})
+        
+        # Try to create ticket via API
+        if session.get('token'):
+            response, error = self.api_request('POST', '/support/tickets/',
+                token=session['token'],
+                data={
+                    'subject': f'[Telegram] {category.title()} Issue',
+                    'message': message,
+                    'category': category
+                }
+            )
+            
+            if response and response.status_code == 201:
+                ticket = response.json()
+                await update.message.reply_text(
+                    f"✅ **Ticket Created!**\n\n"
+                    f"**Ticket ID:** #{ticket.get('id')}\n"
+                    f"**Category:** {category.title()}\n\n"
+                    f"We'll respond within 24-48 hours.\n"
+                    f"Check status at: {self.website_url}/support",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                context.user_data.clear()
+                return ConversationHandler.END
+        
+        # Fallback - store for manual handling
+        await update.message.reply_text(
+            f"✅ **Message Received!**\n\n"
+            f"Our team will review your message.\n\n"
+            f"📧 You can also email: {self.support_email}\n"
+            f"🌐 Or visit: {self.website_url}/support",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    async def faq_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show FAQ"""
+        keyboard = [
+            [InlineKeyboardButton("💰 Withdrawals", callback_data="faq_withdraw"),
+             InlineKeyboardButton("🚿 Faucet", callback_data="faq_faucet")],
+            [InlineKeyboardButton("👥 Referrals", callback_data="faq_referral"),
+             InlineKeyboardButton("📝 Tasks", callback_data="faq_task")],
+            [InlineKeyboardButton("📊 Minimum", callback_data="faq_minimum"),
+             InlineKeyboardButton("💵 Earn", callback_data="faq_earn")],
+        ]
+        
+        await update.message.reply_text(
+            "❓ **Frequently Asked Questions**\n\nSelect a topic:",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+    # ==================== CALLBACK HANDLER ====================
+    
     async def button_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle button callbacks."""
+        """Handle all button callbacks"""
         query = update.callback_query
         await query.answer()
         
         data = query.data
         
-        if data == "register_email":
-            context.user_data['register_awaiting_username'] = True
-            await query.edit_message_text("👤 Please choose a username:")
-            
-        elif data == "cancel":
-            context.user_data.clear()
-            await query.edit_message_text("❌ Operation cancelled.")
-
-    async def balance_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Check user balance."""
-        user_id = update.effective_user.id
+        # Start actions
+        if data == "start_login":
+            await query.message.reply_text("📧 Enter your email:")
+            return AWAITING_EMAIL
         
-        if user_id not in self.user_sessions:
-            await update.message.reply_text("🔐 Please login first using /login")
+        if data == "start_register":
+            await query.message.reply_text("👤 Choose a username:")
+            return AWAITING_REG_USERNAME
+        
+        # Command shortcuts
+        if data == "cmd_balance":
+            # Simulate balance command
+            update.message = query.message
+            await self.balance_command(update, context)
             return
         
-        token = self.user_sessions[user_id]['token']
+        if data == "cmd_stats":
+            update.message = query.message
+            await self.stats_command(update, context)
+            return
         
-        try:
-            headers = {'Authorization': f'Token {token}'}
-            response = requests.get(f"{self.api_base_url}/dashboard/stats/", headers=headers, timeout=10)
-            
-            if response.status_code == 200:
-                data = response.json()
-                balance = data.get('balance', 0)
-                total_earned = data.get('total_earned', 0)
-                
-                message = (
-                    f"💰 Your Balance\n\n"
-                    f"Current Balance: ${balance:.2f}\n"
-                    f"Total Earned: ${total_earned:.2f}\n"
-                    f"Streak: {data.get('streak_days', 0)} days\n"
-                    f"Level: {data.get('level', 1)}\n\n"
-                    f"📱 Visit our website for withdrawals and full features:\n"
-                    f"{self.website_url}"
+        if data == "cmd_referral":
+            update.message = query.message
+            await self.referral_command(update, context)
+            return
+        
+        if data == "cmd_leaderboard":
+            update.message = query.message
+            await self.leaderboard_command(update, context)
+            return
+        
+        if data == "cmd_support":
+            keyboard = [
+                [InlineKeyboardButton("💰 Withdrawal", callback_data="support_withdrawal")],
+                [InlineKeyboardButton("📝 Task", callback_data="support_task")],
+                [InlineKeyboardButton("🔐 Account", callback_data="support_account")],
+                [InlineKeyboardButton("❓ Other", callback_data="support_other")],
+            ]
+            await query.edit_message_text(
+                "🆘 **Support**\n\nWhat do you need help with?",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            return
+        
+        if data == "cmd_faq":
+            update.message = query.message
+            await self.faq_command(update, context)
+            return
+        
+        # Support categories
+        if data.startswith("support_"):
+            context.user_data['support_category'] = data.replace('support_', '')
+            await query.edit_message_text(
+                "📝 Describe your issue in detail:\n\n/cancel to exit"
+            )
+            return AWAITING_SUPPORT_MESSAGE
+        
+        # FAQ answers
+        if data.startswith("faq_"):
+            topic = data.replace("faq_", "")
+            if topic in self.knowledge_base:
+                answer = self.knowledge_base[topic].format(
+                    website=self.website_url, 
+                    email=self.support_email
                 )
-                await update.message.reply_text(message)
-            else:
-                await update.message.reply_text("❌ Failed to fetch balance. Please try again.")
-                
-        except Exception as e:
-            logger.error(f"Balance error: {e}")
-            await update.message.reply_text("❌ Connection error. Please try again later.")
+                await query.edit_message_text(answer, parse_mode=ParseMode.MARKDOWN)
 
-    async def tasks_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Show available tasks with website redirect."""
-        user_id = update.effective_user.id
+    # ==================== MESSAGE ROUTER ====================
+    
+    async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Route messages based on chat type"""
+        chat = update.effective_chat
         
-        if user_id not in self.user_sessions:
-            await update.message.reply_text("🔐 Please login first using /login")
-            return
-        
-        await update.message.reply_text(
-            f"📝 Available Tasks\n\n"
-            f"To view and start tasks, please visit our website:\n"
-            f"{self.website_url}\n\n"
-            f"The web platform provides:\n"
-            f"• Complete task browsing with images\n"
-            f"• Easy task submission\n"
-            f"• Progress tracking\n"
-            f"• Instant rewards\n"
-            f"• Better user experience\n\n"
-            f"💡 You can complete tasks directly on the website for faster earnings!"
-        )
+        if chat.type in [ChatType.GROUP, ChatType.SUPERGROUP]:
+            await self.handle_group_message(update, context)
+        # Private messages handled by conversation handlers
 
-    async def withdraw_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Show withdrawal options with website redirect."""
-        user_id = update.effective_user.id
-        
-        if user_id not in self.user_sessions:
-            await update.message.reply_text("🔐 Please login first using /login")
-            return
-        
-        await update.message.reply_text(
-            f"💰 Withdrawal Options\n\n"
-            f"To manage withdrawals, please visit our website:\n"
-            f"{self.website_url}\n\n"
-            f"On the website you can:\n"
-            f"• View all available withdrawal methods\n"
-            f"• Check minimum amounts and processing times\n"
-            f"• Submit withdrawal requests securely\n"
-            f"• Track your withdrawal status\n"
-            f"• View transaction history\n\n"
-            f"💡 All financial operations are processed through our secure web platform for your safety."
-        )
+    # ==================== SCHEDULED TASKS ====================
+    
+    async def scheduled_post_job(self, context: ContextTypes.DEFAULT_TYPE):
+        """Job to check for scheduled posts"""
+        await self.fetch_scheduled_posts(context)
 
-    async def referral_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Show referral information."""
-        user_id = update.effective_user.id
-        
-        if user_id not in self.user_sessions:
-            await update.message.reply_text("🔐 Please login first using /login")
-            return
-        
-        token = self.user_sessions[user_id]['token']
-        
-        try:
-            headers = {'Authorization': f'Token {token}'}
-            response = requests.get(f"{self.api_base_url}/my-referral-info/", headers=headers, timeout=10)
-            
-            if response.status_code == 200:
-                data = response.json()
-                referral_code = data.get('referral_code', 'N/A')
-                referral_url = data.get('referral_url', 'N/A')
-                total_referrals = data.get('total_referrals', 0)
-                referral_earnings = data.get('referral_earnings', 0)
-                
-                message = (
-                    f"👥 Referral Program\n\n"
-                    f"Your Referral Code: <code>{referral_code}</code>\n"
-                    f"Total Referrals: {total_referrals}\n"
-                    f"Referral Earnings: ${referral_earnings:.2f}\n\n"
-                    f"Share your referral link:\n{referral_url}\n\n"
-                    f"Earn 10% commission on all your referrals' earnings!\n\n"
-                    f"📱 Visit our website for more referral tools:\n"
-                    f"{self.website_url}"
-                )
-                await update.message.reply_text(message, parse_mode='HTML')
-            else:
-                await update.message.reply_text("❌ Failed to fetch referral info.")
-                
-        except Exception as e:
-            logger.error(f"Referral error: {e}")
-            await update.message.reply_text("❌ Connection error. Please try again.")
+    async def sync_settings_job(self, context: ContextTypes.DEFAULT_TYPE):
+        """Job to sync moderation settings"""
+        await self.fetch_mod_settings()
 
-    async def leaderboard_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Show leaderboard."""
-        user_id = update.effective_user.id
-        
-        if user_id not in self.user_sessions:
-            await update.message.reply_text("🔐 Please login first using /login")
-            return
-        
-        token = self.user_sessions[user_id]['token']
-        
-        try:
-            headers = {'Authorization': f'Token {token}'}
-            response = requests.get(f"{self.api_base_url}/leaderboard/top-earners/", headers=headers, timeout=10)
-            
-            if response.status_code == 200:
-                data = response.json()
-                top_earners = data.get('top_earners', [])
-                
-                message = "🏆 Top Earners Leaderboard\n\n"
-                for i, earner in enumerate(top_earners[:10], 1):
-                    username = earner.get('username', 'Anonymous')
-                    earnings = earner.get('earnings', 0)
-                    message += f"{i}. {username} - ${earnings:.2f}\n"
-                
-                message += f"\n📱 Visit our website for full leaderboard:\n{self.website_url}"
-                await update.message.reply_text(message)
-            else:
-                await update.message.reply_text("❌ Failed to fetch leaderboard.")
-                
-        except Exception as e:
-            logger.error(f"Leaderboard error: {e}")
-            await update.message.reply_text("❌ Connection error. Please try again.")
-
-    async def offerwalls_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Show available offerwalls."""
-        user_id = update.effective_user.id
-        
-        if user_id not in self.user_sessions:
-            await update.message.reply_text("🔐 Please login first using /login")
-            return
-        
-        keyboard = [
-            [InlineKeyboardButton("TimeWall", callback_data="offerwall_timewall")],
-            [InlineKeyboardButton("BitLabs", callback_data="offerwall_bitlabs")],
-            [InlineKeyboardButton("PubScale", callback_data="offerwall_pubscale")],
-            [InlineKeyboardButton("RevToo", callback_data="offerwall_revtoo")],
-            [InlineKeyboardButton("CPX Research", callback_data="offerwall_cpx")],
-            [InlineKeyboardButton("KiwiWall", callback_data="offerwall_kiwiwall")],
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await update.message.reply_text(
-            "🎯 Available Offerwalls\n\n"
-            "Complete surveys and offers to earn money!\n"
-            "Choose an offerwall to get started:",
-            reply_markup=reply_markup
-        )
-
-    async def achievements_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Show user's achievements."""
-        user_id = update.effective_user.id
-        
-        if user_id not in self.user_sessions:
-            await update.message.reply_text("🔐 Please login first using /login")
-            return
-        
-        token = self.user_sessions[user_id]['token']
-        
-        try:
-            headers = {'Authorization': f'Token {token}'}
-            response = requests.get(f"{self.api_base_url}/user-achievements/", headers=headers, timeout=10)
-            
-            if response.status_code == 200:
-                achievements = response.json()
-                
-                if not achievements:
-                    await update.message.reply_text(
-                        "🏆 You haven't unlocked any achievements yet. Complete tasks to earn achievements!\n\n"
-                        f"📱 Visit our website to start earning:\n{self.website_url}"
-                    )
-                    return
-                
-                message = "🏆 Your Achievements\n\n"
-                for achievement in achievements[:10]:
-                    title = achievement.get('achievement_title', 'Unknown')
-                    description = achievement.get('achievement_description', '')
-                    message += f"• {title}\n  {description}\n\n"
-                
-                message += f"📱 View all achievements on our website:\n{self.website_url}"
-                await update.message.reply_text(message)
-            else:
-                await update.message.reply_text("❌ Failed to fetch achievements. Please try again.")
-                
-        except Exception as e:
-            logger.error(f"Achievements error: {e}")
-            await update.message.reply_text("❌ Connection error. Please try again.")
-
-    async def support_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Show support information."""
-        support_text = f"""
-🆘 Support & Help
-
-If you need assistance, here's how you can get help:
-
-1. **Common Issues:**
-   - Forgot password? Use /login to reset
-   - Withdrawal issues? Visit our website
-   - Task not approved? Contact support
-
-2. **Contact Support:**
-   - Email: support@earnquest.com
-   - Website: {self.website_url}
-   - Response time: 24-48 hours
-
-3. **Before Contacting:**
-   - Check /help for common solutions
-   - Ensure you're logged in with /login
-   - Check your balance with /balance
-
-We're here to help you earn more! 💰
-        """
-        await update.message.reply_text(support_text)
-
-    async def stats_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Show user statistics."""
-        user_id = update.effective_user.id
-        
-        if user_id not in self.user_sessions:
-            await update.message.reply_text("🔐 Please login first using /login")
-            return
-        
-        token = self.user_sessions[user_id]['token']
-        
-        try:
-            headers = {'Authorization': f'Token {token}'}
-            response = requests.get(f"{self.api_base_url}/dashboard/stats/", headers=headers, timeout=10)
-            
-            if response.status_code == 200:
-                data = response.json()
-                
-                message = (
-                    f"📊 Your Statistics\n\n"
-                    f"💰 Current Balance: ${data.get('balance', 0):.2f}\n"
-                    f"💰 Total Earned: ${data.get('total_earned', 0):.2f}\n"
-                    f"📈 Today's Earnings: ${data.get('today_earnings', 0):.2f}\n"
-                    f"✅ Tasks Completed: {data.get('total_tasks', 0)}\n"
-                    f"🔥 Streak Days: {data.get('streak_days', 0)}\n"
-                    f"🎯 Level: {data.get('level', 1)}\n"
-                    f"👥 Referrals: {data.get('referral_stats', {}).get('total_referrals', 0)}\n"
-                    f"💰 Referral Earnings: ${data.get('referral_stats', {}).get('earnings', 0):.2f}\n\n"
-                    f"📱 Visit our website for detailed analytics:\n{self.website_url}"
-                )
-                await update.message.reply_text(message)
-            else:
-                await update.message.reply_text("❌ Failed to fetch statistics. Please try again.")
-                
-        except Exception as e:
-            logger.error(f"Stats error: {e}")
-            await update.message.reply_text("❌ Connection error. Please try again.")
-
-    async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Show help message."""
-        help_text = f"""
-🤖 EarnQuest Bot Help
-
-Available Commands:
-/login - Login to your account
-/register - Create a new account
-/balance - Check your balance and stats
-/tasks - View available tasks (Website)
-/withdraw - Request withdrawal (Website)
-/referral - Get referral code and stats
-/leaderboard - View top earners
-/offerwalls - Complete surveys and offers
-/achievements - View your achievements
-/stats - View your earning statistics
-/support - Get help and support
-/help - Show this help message
-
-📱 Full features available on our website:
-{self.website_url}
-
-Need assistance? Use /support to contact our team.
-
-Happy earning! 💰
-        """
-        await update.message.reply_text(help_text)
-
-    async def error_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle errors in the telegram bot."""
-        logger.error(f"Exception while handling an update: {context.error}")
-
+    # ==================== SETUP ====================
+    
     def setup_handlers(self):
-        """Setup bot handlers."""
+        """Setup all handlers"""
         if not self.token:
-            logger.error("TELEGRAM_BOT_TOKEN is not configured")
+            logger.error("TELEGRAM_BOT_TOKEN not set!")
             return False
-            
+        
         try:
             self.application = Application.builder().token(self.token).build()
             
-            # Add command handlers
+            # Login conversation
+            login_conv = ConversationHandler(
+                entry_points=[
+                    CommandHandler('login', self.login_command),
+                    CallbackQueryHandler(self.button_handler, pattern='^start_login$')
+                ],
+                states={
+                    AWAITING_EMAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.receive_email)],
+                    AWAITING_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.receive_password)],
+                },
+                fallbacks=[CommandHandler('cancel', self.cancel)],
+            )
+            
+            # Register conversation
+            register_conv = ConversationHandler(
+                entry_points=[
+                    CommandHandler('register', self.register_command),
+                    CallbackQueryHandler(self.button_handler, pattern='^start_register$')
+                ],
+                states={
+                    AWAITING_REG_USERNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.receive_reg_username)],
+                    AWAITING_REG_EMAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.receive_reg_email)],
+                    AWAITING_REG_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.receive_reg_password)],
+                },
+                fallbacks=[CommandHandler('cancel', self.cancel)],
+            )
+            
+            # Support conversation
+            support_conv = ConversationHandler(
+                entry_points=[
+                    CommandHandler('support', self.support_command),
+                    CallbackQueryHandler(self.receive_support_category, pattern='^support_')
+                ],
+                states={
+                    AWAITING_SUPPORT_MESSAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.receive_support_message)],
+                },
+                fallbacks=[CommandHandler('cancel', self.cancel)],
+            )
+            
+            # Add conversation handlers first
+            self.application.add_handler(login_conv)
+            self.application.add_handler(register_conv)
+            self.application.add_handler(support_conv)
+            
+            # Commands
             self.application.add_handler(CommandHandler("start", self.start))
-            self.application.add_handler(CommandHandler("login", self.login_command))
-            self.application.add_handler(CommandHandler("register", self.register_command))
+            self.application.add_handler(CommandHandler("help", self.start))
             self.application.add_handler(CommandHandler("balance", self.balance_command))
-            self.application.add_handler(CommandHandler("tasks", self.tasks_command))
-            self.application.add_handler(CommandHandler("withdraw", self.withdraw_command))
+            self.application.add_handler(CommandHandler("stats", self.stats_command))
             self.application.add_handler(CommandHandler("referral", self.referral_command))
             self.application.add_handler(CommandHandler("leaderboard", self.leaderboard_command))
-            self.application.add_handler(CommandHandler("offerwalls", self.offerwalls_command))
-            self.application.add_handler(CommandHandler("achievements", self.achievements_command))
-            self.application.add_handler(CommandHandler("support", self.support_command))
-            self.application.add_handler(CommandHandler("stats", self.stats_command))
-            self.application.add_handler(CommandHandler("help", self.help_command))
+            self.application.add_handler(CommandHandler("faq", self.faq_command))
+            self.application.add_handler(CommandHandler("rules", self.rules_command))
             
-            # Add callback query handler
+            # Callback handler
             self.application.add_handler(CallbackQueryHandler(self.button_handler))
             
-            # Add message handler for login/registration
-            self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
+            # New members
+            self.application.add_handler(MessageHandler(
+                filters.StatusUpdate.NEW_CHAT_MEMBERS, 
+                self.handle_new_member
+            ))
             
-            # Add error handler
-            self.application.add_error_handler(self.error_handler)
+            # All other messages
+            self.application.add_handler(MessageHandler(
+                filters.TEXT & ~filters.COMMAND,
+                self.handle_message
+            ))
             
+            # Scheduled jobs
+            job_queue = self.application.job_queue
+            job_queue.run_repeating(self.scheduled_post_job, interval=60, first=10)  # Check every minute
+            job_queue.run_repeating(self.sync_settings_job, interval=300, first=5)  # Sync every 5 minutes
+            
+            logger.info("✅ Bot handlers configured!")
             return True
             
         except Exception as e:
-            logger.error(f"Failed to setup Telegram bot handlers: {e}")
+            logger.error(f"Setup failed: {e}")
             return False
 
     def run(self):
-        """Run the bot."""
+        """Run the bot"""
         if not self.setup_handlers():
             return
         
-        logger.info("🤖 Starting Telegram Bot...")
-        
-        # Start the bot with polling
-        self.application.run_polling()
+        logger.info("🤖 Starting EarnQuest Bot...")
+        self.application.run_polling(allowed_updates=Update.ALL_TYPES)
 
-# Create and run bot instance
+
 if __name__ == "__main__":
     bot = EarnQuestBot()
     bot.run()
