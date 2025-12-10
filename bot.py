@@ -503,6 +503,107 @@ class EarnQuestBot:
         rules = rules.replace('{website}', self.website_url)
         await update.message.reply_text(rules, parse_mode=ParseMode.MARKDOWN)
 
+    async def unban_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Unban a user (admin only). Usage: /unban @username or /unban user_id"""
+        user = update.effective_user
+        chat = update.effective_chat
+        
+        # Only allow in groups and only for admins
+        if chat.type not in [ChatType.GROUP, ChatType.SUPERGROUP]:
+            await update.message.reply_text("⚠️ This command only works in groups.")
+            return
+        
+        # Check if user is admin
+        try:
+            member = await context.bot.get_chat_member(chat.id, user.id)
+            if member.status not in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]:
+                await update.message.reply_text("⛔ Only admins can unban users.")
+                return
+        except:
+            await update.message.reply_text("❌ Could not verify admin status.")
+            return
+        
+        # Get user to unban from command args
+        if not context.args:
+            await update.message.reply_text(
+                "**Usage:**\n"
+                "• `/unban @username`\n"
+                "• `/unban 123456789` (user ID)\n"
+                "• Reply to a message with `/unban`",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        
+        target_user_id = None
+        target_username = None
+        
+        # Check if replying to a message
+        if update.message.reply_to_message:
+            target_user_id = update.message.reply_to_message.from_user.id
+            target_username = update.message.reply_to_message.from_user.username
+        else:
+            arg = context.args[0]
+            if arg.startswith('@'):
+                target_username = arg[1:]  # Remove @ prefix
+            else:
+                try:
+                    target_user_id = int(arg)
+                except ValueError:
+                    await update.message.reply_text("❌ Invalid user ID. Use a number or @username.")
+                    return
+        
+        try:
+            # Unban in Telegram
+            if target_user_id:
+                await context.bot.unban_chat_member(chat.id, target_user_id, only_if_banned=True)
+                logger.info(f"✅ Unbanned user {target_user_id} from chat {chat.id}")
+            
+            # Remove from database via API
+            headers = {'Content-Type': 'application/json'}
+            if self.bot_api_key:
+                headers['X-Bot-Key'] = self.bot_api_key
+            
+            # Try to delete by user_id or username
+            delete_data = {}
+            if target_user_id:
+                delete_data['telegram_user_id'] = str(target_user_id)
+            if target_username:
+                delete_data['telegram_username'] = target_username
+            
+            response = requests.delete(
+                f"{self.api_base_url}/bot/banned-users/",
+                json=delete_data,
+                headers=headers,
+                timeout=15
+            )
+            
+            if response.status_code in [200, 204]:
+                await update.message.reply_text(
+                    f"✅ User unbanned successfully!\n\n"
+                    f"ID: `{target_user_id}`\n"
+                    f"Username: @{target_username or 'N/A'}",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+            else:
+                await update.message.reply_text(
+                    f"⚠️ Unbanned in Telegram but couldn't remove from database.\n"
+                    f"Go to Django Admin to remove the ban record.",
+                )
+                
+            # Log the unban
+            await self.report_to_backend(
+                event_type='user_unbanned',
+                data={'unbanned_by': user.username or user.first_name},
+                telegram_user_id=target_user_id,
+                telegram_username=target_username,
+                chat_id=chat.id,
+                description=f"User unbanned by @{user.username or user.first_name}"
+            )
+            
+        except Exception as e:
+            logger.error(f"Failed to unban: {e}")
+            await update.message.reply_text(f"❌ Failed to unban: {e}")
+
     async def sync_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Manually sync settings from backend (admin only)"""
         user = update.effective_user
@@ -1561,6 +1662,7 @@ _Tap a button below to get started!_
             self.application.add_handler(CommandHandler("earn", self.offerwalls_command))  # Alias
             self.application.add_handler(CommandHandler("faq", self.faq_command))
             self.application.add_handler(CommandHandler("rules", self.rules_command))
+            self.application.add_handler(CommandHandler("unban", self.unban_command))
             self.application.add_handler(CommandHandler("sync", self.sync_command))
             
             # Callback handler
@@ -1632,6 +1734,7 @@ _Tap a button below to get started!_
             BotCommand("support", "Get help & support"),
             BotCommand("faq", "Frequently asked questions"),
             BotCommand("rules", "View group rules"),
+            BotCommand("unban", "Unban a user (admin)"),
             BotCommand("sync", "Sync settings (admin)"),
             BotCommand("cancel", "Cancel current action"),
         ]
