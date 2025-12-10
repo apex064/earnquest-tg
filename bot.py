@@ -992,6 +992,7 @@ _Tap a button below to get started!_
                     AWAITING_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.receive_password)],
                 },
                 fallbacks=[CommandHandler('cancel', self.cancel)],
+                per_message=False,
             )
             
             # Register conversation
@@ -1006,6 +1007,7 @@ _Tap a button below to get started!_
                     AWAITING_REG_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.receive_reg_password)],
                 },
                 fallbacks=[CommandHandler('cancel', self.cancel)],
+                per_message=False,
             )
             
             # Support conversation
@@ -1018,6 +1020,7 @@ _Tap a button below to get started!_
                     AWAITING_SUPPORT_MESSAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.receive_support_message)],
                 },
                 fallbacks=[CommandHandler('cancel', self.cancel)],
+                per_message=False,
             )
             
             # Add conversation handlers first
@@ -1050,10 +1053,14 @@ _Tap a button below to get started!_
                 self.handle_message
             ))
             
-            # Scheduled jobs
+            # Scheduled jobs (requires job-queue extension)
             job_queue = self.application.job_queue
-            job_queue.run_repeating(self.scheduled_post_job, interval=60, first=10)  # Check every minute
-            job_queue.run_repeating(self.sync_settings_job, interval=300, first=5)  # Sync every 5 minutes
+            if job_queue:
+                job_queue.run_repeating(self.scheduled_post_job, interval=60, first=10)  # Check every minute
+                job_queue.run_repeating(self.sync_settings_job, interval=300, first=5)  # Sync every 5 minutes
+                logger.info("✅ Job queue configured!")
+            else:
+                logger.warning("⚠️ Job queue not available. Install with: pip install 'python-telegram-bot[job-queue]'")
             
             logger.info("✅ Bot handlers configured!")
             return True
