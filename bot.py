@@ -1262,6 +1262,21 @@ Surveys are available through our offerwalls!
                 self.handle_message
             ))
             
+            # Error handler
+            async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+                """Handle errors gracefully"""
+                error = context.error
+                
+                # Ignore conflict errors (multiple instances)
+                if "Conflict" in str(error):
+                    logger.warning("⚠️ Conflict with another instance - this will resolve automatically")
+                    return
+                
+                # Log other errors
+                logger.error(f"Exception while handling an update: {error}")
+            
+            self.application.add_error_handler(error_handler)
+            
             # Scheduled jobs (requires job-queue extension)
             job_queue = self.application.job_queue
             if job_queue:
@@ -1278,15 +1293,83 @@ Surveys are available through our offerwalls!
             logger.error(f"Setup failed: {e}")
             return False
 
+    async def clear_webhook_and_updates(self):
+        """Clear webhook and pending updates before starting"""
+        import httpx
+        try:
+            async with httpx.AsyncClient() as client:
+                # Delete webhook and drop pending updates
+                url = f"https://api.telegram.org/bot{self.token}/deleteWebhook?drop_pending_updates=true"
+                response = await client.post(url)
+                if response.status_code == 200:
+                    logger.info("✅ Webhook cleared, pending updates dropped")
+                else:
+                    logger.warning(f"⚠️ Failed to clear webhook: {response.text}")
+        except Exception as e:
+            logger.error(f"Error clearing webhook: {e}")
+
     def run(self):
         """Run the bot"""
+        import time
+        
+        # Wait for old instance to fully stop
+        logger.info("⏳ Waiting 5 seconds for old instance to stop...")
+        time.sleep(5)
+        
         if not self.setup_handlers():
             return
         
         logger.info("🤖 Starting EarnQuest Bot...")
-        self.application.run_polling(allowed_updates=Update.ALL_TYPES)
+        
+        # Run polling with error handling
+        try:
+            self.application.run_polling(
+                allowed_updates=Update.ALL_TYPES,
+                drop_pending_updates=True,  # Drop any queued updates
+                close_loop=False
+            )
+        except Exception as e:
+            logger.error(f"Bot stopped with error: {e}")
 
 
 if __name__ == "__main__":
+    import time
+    import sys
+    
+    # Add startup delay to prevent conflicts during deployment
+    startup_delay = int(os.environ.get('BOT_STARTUP_DELAY', '5'))
+    if startup_delay > 0:
+        logger.info(f"⏳ Startup delay: {startup_delay} seconds...")
+        time.sleep(startup_delay)
+    
+    # Clear any existing sessions via API
+    token = os.environ.get('TELEGRAM_BOT_TOKEN')
+    if token:
+        try:
+            import requests
+            # Force delete webhook and drop pending updates
+            url = f"https://api.telegram.org/bot{token}/deleteWebhook?drop_pending_updates=true"
+            response = requests.post(url, timeout=10)
+            logger.info(f"🔄 Webhook cleanup: {response.json()}")
+            
+            # Small delay after cleanup
+            time.sleep(2)
+        except Exception as e:
+            logger.warning(f"Webhook cleanup failed: {e}")
+    
     bot = EarnQuestBot()
-    bot.run()
+    
+    # Retry logic for conflict errors
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            bot.run()
+            break
+        except Exception as e:
+            if "Conflict" in str(e) and attempt < max_retries - 1:
+                wait_time = (attempt + 1) * 10
+                logger.warning(f"⚠️ Conflict detected, waiting {wait_time}s before retry...")
+                time.sleep(wait_time)
+            else:
+                logger.error(f"❌ Bot failed: {e}")
+                sys.exit(1)
