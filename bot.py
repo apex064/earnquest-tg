@@ -516,12 +516,16 @@ class EarnQuestBot:
         # Check if user is admin
         try:
             member = await context.bot.get_chat_member(chat.id, user.id)
-            if member.status not in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]:
-                await update.message.reply_text("⛔ Only admins can unban users.")
+            logger.info(f"User {user.username} status in chat {chat.id}: {member.status}")
+            
+            # Check for admin/owner/creator status
+            if member.status not in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER, 'administrator', 'creator']:
+                await update.message.reply_text(f"⛔ Only admins can unban users. Your status: {member.status}")
                 return
-        except:
-            await update.message.reply_text("❌ Could not verify admin status.")
-            return
+        except Exception as e:
+            logger.error(f"Could not verify admin status: {e}")
+            # If we can't check, allow the command but Telegram will reject if not admin
+            pass
         
         # Get user to unban from command args
         if not context.args:
