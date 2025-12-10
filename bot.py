@@ -339,7 +339,7 @@ class EarnQuestBot:
                     chat_id=chat.id,
                     description=f"Muted @{user.username or user.first_name} for 5 minutes (spam)"
                 )
-        except Exception as e:
+            except Exception as e:
                 logger.error(f"❌ Failed to handle spam: {e}")
             return True
         
@@ -618,7 +618,7 @@ class EarnQuestBot:
         
         if chat.type in [ChatType.GROUP, ChatType.SUPERGROUP]:
             # Group - show brief info
-                await update.message.reply_text(
+            await update.message.reply_text(
                 f"🤖 **EarnQuest Bot**\n\n"
                 f"I'm here to help and keep this group clean!\n\n"
                 f"🌐 Start earning: {self.website_url}\n"
@@ -707,7 +707,7 @@ _Tap a button below to get started!_
         # Delete password message
         try:
             await update.message.delete()
-                except:
+        except:
             pass
         
         status_msg = await update.effective_chat.send_message("🔄 Logging in...")
@@ -719,7 +719,7 @@ _Tap a button below to get started!_
         
         if error:
             await status_msg.edit_text(f"❌ Connection error. Please try again later.")
-        context.user_data.clear()
+            context.user_data.clear()
             return ConversationHandler.END
         
         if response.status_code == 200:
@@ -818,7 +818,7 @@ _Tap a button below to get started!_
             return ConversationHandler.END
         
         if response.status_code == 201:
-                data = response.json()
+            data = response.json()
             
             # Log the registration event
             await self.report_to_backend(
@@ -836,7 +836,7 @@ _Tap a button below to get started!_
                 f"Use /login to access your account.",
                 parse_mode=ParseMode.MARKDOWN
             )
-            else:
+        else:
             try:
                 errors = response.json()
                 error_text = str(errors)
@@ -934,7 +934,7 @@ _Tap a button below to get started!_
             await update.message.reply_text("❌ Failed to fetch referral info.")
             return
         
-                data = response.json()
+        data = response.json()
         
         await update.message.reply_text(
             f"👥 **Your Referral Program**\n\n"
@@ -962,7 +962,7 @@ _Tap a button below to get started!_
             await update.message.reply_text("❌ Failed to fetch leaderboard.")
             return
         
-                data = response.json()
+        data = response.json()
         top = data.get('top_earners', [])[:10]
         
         medals = ['🥇', '🥈', '🥉'] + ['🏅'] * 7
@@ -1219,7 +1219,7 @@ _Tap a button below to get started!_
                 msg += f"\n_...and {len(surveys) - 5} more surveys!_\n"
             
             msg += f"\n💰 **Total Potential:** ${total_payout:.2f}\n"
-            else:
+        else:
             msg += "Survey data loading...\n"
             msg += "Tap the button below to browse available surveys!\n\n"
         
@@ -1712,7 +1712,7 @@ if __name__ == "__main__":
     max_retries = 3
     for attempt in range(max_retries):
         try:
-    bot.run()
+            bot.run()
             break
         except Exception as e:
             if "Conflict" in str(e) and attempt < max_retries - 1:
