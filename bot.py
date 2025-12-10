@@ -174,8 +174,22 @@ class EarnQuestBot:
                             text=content,
                             parse_mode=ParseMode.MARKDOWN
                         )
+                    
+                    # Log successful post
+                    await self.report_to_backend(
+                        event_type='post_sent',
+                        data={'post_id': post_id, 'post_type': post_type, 'has_image': bool(image_url)},
+                        chat_id=int(group_id) if str(group_id).lstrip('-').isdigit() else None,
+                        description=f"Scheduled post #{post_id} ({post_type}) sent successfully"
+                    )
                 except Exception as e:
                     logger.error(f"Failed to post to {group_id}: {e}")
+                    # Log failed post
+                    await self.report_to_backend(
+                        event_type='error',
+                        data={'post_id': post_id, 'error': str(e), 'target_group': group_id},
+                        description=f"Failed to send scheduled post #{post_id} to {group_id}: {e}"
+                    )
             
             # Mark post as executed
             self.api_request('POST', f'/bot/scheduled-posts/{post_id}/mark-executed/')
@@ -194,16 +208,44 @@ class EarnQuestBot:
         except Exception as e:
             logger.error(f"Error fetching settings: {e}")
 
-    async def report_to_backend(self, event_type: str, data: dict):
+    async def report_to_backend(self, event_type: str, data: dict, 
+                                  telegram_user_id: int = None, 
+                                  telegram_username: str = None,
+                                  chat_id: int = None,
+                                  description: str = None):
         """Report events to backend for logging"""
         try:
-            self.api_request('POST', '/bot/events/', data={
+            # Build payload with all required fields
+            payload = {
                 'event_type': event_type,
                 'data': data,
-                'timestamp': datetime.now().isoformat()
-            })
-        except:
-            pass
+            }
+            
+            if telegram_user_id:
+                payload['telegram_user_id'] = telegram_user_id
+            if telegram_username:
+                payload['telegram_username'] = telegram_username
+            if chat_id:
+                payload['chat_id'] = chat_id
+            if description:
+                payload['description'] = description
+            
+            # Make request with bot API key header
+            headers = {'Content-Type': 'application/json'}
+            if self.bot_api_key:
+                headers['X-Bot-Key'] = self.bot_api_key
+            
+            response = requests.post(
+                f"{self.api_base_url}/bot/events/",
+                json=payload,
+                headers=headers,
+                timeout=10
+            )
+            
+            if response.status_code != 200:
+                logger.warning(f"Event logging failed: {response.status_code}")
+        except Exception as e:
+            logger.error(f"Error logging event: {e}")
 
     # ==================== MODERATION (GROUP MODE) ====================
     
@@ -236,6 +278,15 @@ class EarnQuestBot:
                     warning = await chat.send_message(
                         f"⚠️ @{user.username or user.first_name}, links are not allowed!",
                     )
+                    # Log the deletion
+                    await self.report_to_backend(
+                        event_type='message_deleted',
+                        data={'reason': 'Link detected', 'text_preview': text[:100]},
+                        telegram_user_id=user.id,
+                        telegram_username=user.username or user.first_name,
+                        chat_id=chat.id,
+                        description=f"Deleted message with link from @{user.username or user.first_name}"
+                    )
                     # Delete warning after 10 seconds
                     await asyncio.sleep(10)
                     await warning.delete()
@@ -252,6 +303,15 @@ class EarnQuestBot:
                 await self.mute_user_internal(chat.id, user.id, context, 5)  # 5 min mute
                 await chat.send_message(
                     f"🔇 @{user.username or user.first_name} muted for 5 minutes (spam)"
+                )
+                # Log the mute
+                await self.report_to_backend(
+                    event_type='user_muted',
+                    data={'reason': 'Spam detected', 'duration_minutes': 5},
+                    telegram_user_id=user.id,
+                    telegram_username=user.username or user.first_name,
+                    chat_id=chat.id,
+                    description=f"Muted @{user.username or user.first_name} for 5 minutes (spam)"
                 )
             except:
                 pass
@@ -299,15 +359,25 @@ class EarnQuestBot:
                 chat_id,
                 f"🚫 User banned after 3 warnings!"
             )
+            # Log the ban
+            await self.report_to_backend(
+                event_type='user_banned',
+                data={'reason': f'3 warnings: {reason}', 'warning_count': warnings},
+                telegram_user_id=user_id,
+                chat_id=chat_id,
+                description=f"User banned after 3 warnings. Last warning: {reason}"
+            )
             del self.warned_users[user_id]
+            return  # Don't log a warning if we already logged a ban
         
-        # Report to backend
-        await self.report_to_backend('warning', {
-            'user_id': user_id,
-            'chat_id': chat_id,
-            'reason': reason,
-            'warning_count': warnings
-        })
+        # Report warning to backend
+        await self.report_to_backend(
+            event_type='user_warned',
+            data={'reason': reason, 'warning_count': warnings},
+            telegram_user_id=user_id,
+            chat_id=chat_id,
+            description=f"User warned ({warnings}/3): {reason}"
+        )
 
     async def mute_user_internal(self, chat_id: int, user_id: int, context, minutes: int):
         """Mute a user"""
@@ -550,6 +620,15 @@ _Tap a button below to get started!_
                 'email': email
             }
             
+            # Log the login event
+            await self.report_to_backend(
+                event_type='login',
+                data={'platform_user_id': data.get('user_id'), 'username': data.get('username')},
+                telegram_user_id=update.effective_user.id,
+                telegram_username=update.effective_user.username or '',
+                description=f"User {data.get('username')} logged in via Telegram"
+            )
+            
             await status_msg.edit_text(
                 f"✅ **Welcome back, {data.get('username')}!**\n\n"
                 f"Use /balance to check your earnings\n"
@@ -629,6 +708,16 @@ _Tap a button below to get started!_
         
         if response.status_code == 201:
             data = response.json()
+            
+            # Log the registration event
+            await self.report_to_backend(
+                event_type='registration',
+                data={'platform_user_id': data.get('user_id'), 'username': data.get('username')},
+                telegram_user_id=update.effective_user.id,
+                telegram_username=update.effective_user.username or '',
+                description=f"New user {data.get('username')} registered via Telegram"
+            )
+            
             await status_msg.edit_text(
                 f"🎉 **Welcome to EarnQuest, {data.get('username')}!**\n\n"
                 f"💰 You received a **$0.10 welcome bonus!**\n\n"
@@ -1020,6 +1109,16 @@ Surveys are available through our offerwalls!
             
             if response and response.status_code == 201:
                 ticket = response.json()
+                
+                # Log the support ticket event
+                await self.report_to_backend(
+                    event_type='support_ticket',
+                    data={'ticket_id': ticket.get('id'), 'category': category, 'subject': f'[Telegram] {category.title()} Issue'},
+                    telegram_user_id=user.id,
+                    telegram_username=user.username or user.first_name,
+                    description=f"Support ticket #{ticket.get('id')} created: {category.title()}"
+                )
+                
                 await update.message.reply_text(
                     f"✅ **Ticket Created!**\n\n"
                     f"**Ticket ID:** #{ticket.get('id')}\n"
