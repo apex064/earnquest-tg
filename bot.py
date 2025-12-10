@@ -531,6 +531,8 @@ class EarnQuestBot:
             [InlineKeyboardButton("💰 Balance", callback_data="cmd_balance"),
              InlineKeyboardButton("📊 Stats", callback_data="cmd_stats")],
             [InlineKeyboardButton("🎯 Offerwalls", callback_data="cmd_offerwalls"),
+             InlineKeyboardButton("💵 Offers", callback_data="cmd_offers")],
+            [InlineKeyboardButton("📊 Surveys", callback_data="cmd_surveys"),
              InlineKeyboardButton("📝 Tasks", callback_data="cmd_tasks")],
             [InlineKeyboardButton("👥 Referral", callback_data="cmd_referral"),
              InlineKeyboardButton("🏆 Leaderboard", callback_data="cmd_leaderboard")],
@@ -545,15 +547,18 @@ class EarnQuestBot:
 Earn money by completing tasks, surveys, and offers!
 
 **💰 Earning Options:**
-• 🎯 Offerwalls - Complete offers & surveys
-• 📝 Tasks - Simple tasks for quick cash
+• 🎯 Offerwalls - All earning providers
+• 💵 Offers - High-paying app installs
+• 📊 Surveys - Quick opinion surveys
+• 📝 Tasks - Simple tasks for cash
 • 👥 Referrals - Earn 10% from friends
 
 **Quick Commands:**
-/offerwalls - Browse earning opportunities  
+/offerwalls - Browse all providers
+/offers - View available offers
+/surveys - Check available surveys
 /tasks - View available tasks
 /balance - Check your earnings
-/referral - Get your referral link
 
 _Tap a button below to get started!_
 """
@@ -863,8 +868,26 @@ _Tap a button below to get started!_
         msg += f"\n🌐 {self.website_url}/leaderboard"
         await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
+    # Offerwall service names mapping
+    OFFERWALL_NAMES = {
+        'bitlabs': 'Bitlabs',
+        'offertoro': 'OfferToro', 
+        'cpx': 'CPX Research',
+        'lootably': 'Lootably',
+        'adgate': 'AdGate Media',
+        'adgem': 'AdGem',
+        'ayet': 'Ayet Studios',
+        'wannads': 'Wannads',
+        'timewall': 'Timewall',
+        'kiwiwall': 'KiwiWall',
+        'pubscale': 'Pubscale',
+        'revtoo': 'RevToo',
+        'primewall': 'Primewall',
+        'offery': 'Offery',
+    }
+
     async def offerwalls_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Show available offerwalls"""
+        """Show available offerwalls with direct links"""
         user_id = update.effective_user.id
         token = self.get_user_token(user_id)
         
@@ -879,19 +902,37 @@ _Tap a button below to get started!_
         
         status_msg = await update.message.reply_text("🔄 Loading offerwalls...")
         
-        response, error = self.api_request('GET', '/offerwalls/', token=token)
+        # Fetch available offerwall keys
+        response, error = self.api_request('GET', '/keys/', token=token)
         
         if error or response.status_code != 200:
             await status_msg.edit_text("❌ Failed to fetch offerwalls. Try again later.")
             return
         
         data = response.json()
-        offerwalls = data if isinstance(data, list) else data.get('results', data.get('offerwalls', []))
+        available_keys = data.get('keys', {})
+        
+        if not available_keys:
+            await status_msg.edit_text(
+                "📭 **No Offerwalls Available**\n\n"
+                f"Check back later or visit: {self.website_url}/offerwalls",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        
+        # Filter to known offerwall services
+        offerwalls = []
+        for service in available_keys.keys():
+            if service in self.OFFERWALL_NAMES:
+                offerwalls.append({
+                    'service': service,
+                    'name': self.OFFERWALL_NAMES[service]
+                })
         
         if not offerwalls:
             await status_msg.edit_text(
                 "📭 **No Offerwalls Available**\n\n"
-                f"Check back later or visit: {self.website_url}/offerwalls",
+                f"Visit: {self.website_url}/offerwalls",
                 parse_mode=ParseMode.MARKDOWN
             )
             return
@@ -902,27 +943,16 @@ _Tap a button below to get started!_
         
         keyboard = []
         
-        for wall in offerwalls[:10]:  # Limit to 10
-            name = wall.get('name', wall.get('title', 'Unknown'))
-            provider = wall.get('provider', '')
-            status = "✅" if wall.get('is_active', True) else "⏸️"
+        for wall in offerwalls[:12]:  # Limit to 12
+            service = wall['service']
+            name = wall['name']
+            msg += f"✅ **{name}**\n"
             
-            # Get iframe URL if available
-            iframe_url = wall.get('iframe_url', wall.get('url', ''))
-            wall_id = wall.get('id', '')
-            
-            msg += f"{status} **{name}**"
-            if provider:
-                msg += f" ({provider})"
-            msg += "\n"
-            
-            # Create direct link button
-            if wall_id:
-                # Link to offerwall page on website
-                wall_url = f"{self.website_url}/offerwalls?wall={wall_id}"
-                keyboard.append([InlineKeyboardButton(f"🎯 {name}", url=wall_url)])
+            # Create direct link button to website offerwall page
+            wall_url = f"{self.website_url}/offerwalls?service={service}"
+            keyboard.append([InlineKeyboardButton(f"🎯 {name}", url=wall_url)])
         
-        msg += f"\n💡 _Tip: Click a button below to start earning!_"
+        msg += f"\n💡 _Tap a button to open the offerwall on our website!_"
         
         # Add main offerwalls page link
         keyboard.append([InlineKeyboardButton("🌐 View All Offerwalls", url=f"{self.website_url}/offerwalls")])
@@ -1007,38 +1037,144 @@ _Tap a button below to get started!_
         )
 
     async def surveys_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Show survey info - directs to offerwalls"""
+        """Show available surveys from CPX Research"""
         user_id = update.effective_user.id
         token = self.get_user_token(user_id)
         
-        msg = """📊 **Surveys on EarnQuest**
-
-Surveys are available through our offerwalls!
-
-**Popular Survey Providers:**
-• Bitlabs - High payouts
-• CPX Research - Many opportunities
-• Pollfish - Quick surveys
-• Theorem Reach - Regular surveys
-
-**Tips for Surveys:**
-✅ Fill out your profile completely
-✅ Be consistent with answers
-✅ Use a desktop for best experience
-✅ Check multiple providers
-
-"""
+        if not token:
+            await update.message.reply_text(
+                "🔐 **Login Required**\n\n"
+                "Please /login to access surveys!\n\n"
+                f"Or visit: {self.website_url}/offerwalls",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        
+        status_msg = await update.message.reply_text("🔄 Loading surveys...")
+        
+        # Fetch CPX Research surveys
+        response, error = self.api_request('GET', '/cpx/surveys/', token=token)
+        
+        surveys = []
+        if response and response.status_code == 200:
+            data = response.json()
+            surveys = data.get('surveys', [])[:8]  # Limit to 8
+        
+        msg = "📊 **Available Surveys**\n\n"
+        
+        if surveys:
+            msg += f"Found **{len(surveys)}** surveys from CPX Research!\n\n"
+            
+            total_payout = 0
+            for i, survey in enumerate(surveys[:5], 1):
+                payout = float(survey.get('payout', survey.get('payout_original', 0)))
+                duration = survey.get('length_of_interview', survey.get('loi', 'N/A'))
+                total_payout += payout
+                
+                msg += f"{i}. 💵 **${payout:.2f}** - ~{duration} min\n"
+            
+            if len(surveys) > 5:
+                msg += f"\n_...and {len(surveys) - 5} more surveys!_\n"
+            
+            msg += f"\n💰 **Total Potential:** ${total_payout:.2f}\n"
+        else:
+            msg += "No surveys available right now.\n"
+            msg += "Surveys refresh frequently - check back soon!\n"
+        
+        msg += "\n**Tips for Surveys:**\n"
+        msg += "✅ Fill out your profile completely\n"
+        msg += "✅ Be consistent with answers\n"
+        msg += "✅ Use a desktop for best experience\n"
         
         keyboard = [
-            [InlineKeyboardButton("🎯 Go to Offerwalls", url=f"{self.website_url}/offerwalls")],
+            [InlineKeyboardButton("📊 Take Surveys", url=f"{self.website_url}/offerwalls?service=cpx")],
+            [InlineKeyboardButton("🎯 All Offerwalls", callback_data="cmd_offerwalls"),
+             InlineKeyboardButton("💵 View Offers", callback_data="cmd_offers")],
         ]
         
-        if token:
-            keyboard.insert(0, [InlineKeyboardButton("🎯 View Offerwalls", callback_data="cmd_offerwalls")])
-        else:
-            msg += "🔐 /login to access surveys!"
+        await status_msg.edit_text(
+            msg,
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+    async def offers_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show available offers from multiple providers"""
+        user_id = update.effective_user.id
+        token = self.get_user_token(user_id)
         
-        await update.message.reply_text(
+        if not token:
+            await update.message.reply_text(
+                "🔐 **Login Required**\n\n"
+                "Please /login to view offers!\n\n"
+                f"Or visit: {self.website_url}/offerwalls",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        
+        status_msg = await update.message.reply_text("🔄 Loading offers from multiple providers...")
+        
+        all_offers = []
+        providers_loaded = []
+        
+        # Fetch from multiple offer providers
+        offer_endpoints = [
+            ('kiwiwall', '/kiwiwall/offers/?limit=5'),
+            ('revtoo', '/revtoo/offers/?limit=5'),
+            ('ayet', '/ayet/offers/?limit=5'),
+            ('primewall', '/primewall/offers/?limit=5'),
+            ('offery', '/offery/offers/?limit=5'),
+        ]
+        
+        for provider, endpoint in offer_endpoints:
+            try:
+                response, error = self.api_request('GET', endpoint, token=token)
+                if response and response.status_code == 200:
+                    data = response.json()
+                    offers = data.get('offers', data if isinstance(data, list) else [])
+                    for offer in offers[:3]:  # Max 3 per provider
+                        offer['provider'] = provider
+                        all_offers.append(offer)
+                    if offers:
+                        providers_loaded.append(self.OFFERWALL_NAMES.get(provider, provider))
+            except:
+                continue
+        
+        msg = "💰 **Available Offers**\n\n"
+        
+        if all_offers:
+            msg += f"Loaded from: {', '.join(providers_loaded)}\n\n"
+            
+            # Sort by payout (highest first)
+            all_offers.sort(key=lambda x: float(x.get('payout', x.get('amount', x.get('revenue', 0)))), reverse=True)
+            
+            total_value = 0
+            for i, offer in enumerate(all_offers[:10], 1):
+                name = offer.get('name', offer.get('title', offer.get('offer_name', 'Offer')))[:35]
+                payout = float(offer.get('payout', offer.get('amount', offer.get('revenue', 0))))
+                provider = self.OFFERWALL_NAMES.get(offer.get('provider', ''), offer.get('provider', ''))
+                total_value += payout
+                
+                msg += f"{i}. **{name}**\n"
+                msg += f"   💵 ${payout:.2f} | 📦 {provider}\n"
+            
+            if len(all_offers) > 10:
+                msg += f"\n_...and {len(all_offers) - 10} more offers!_\n"
+            
+            msg += f"\n💰 **Top 10 Value:** ${total_value:.2f}\n"
+        else:
+            msg += "No offers available right now.\n"
+            msg += "Check back soon for new earning opportunities!\n"
+        
+        msg += "\n💡 _Complete offers on our website to earn!_"
+        
+        keyboard = [
+            [InlineKeyboardButton("💰 View All Offers", url=f"{self.website_url}/offerwalls")],
+            [InlineKeyboardButton("📊 Surveys", callback_data="cmd_surveys"),
+             InlineKeyboardButton("🎯 Offerwalls", callback_data="cmd_offerwalls")],
+        ]
+        
+        await status_msg.edit_text(
             msg,
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=InlineKeyboardMarkup(keyboard)
@@ -1216,6 +1352,11 @@ Surveys are available through our offerwalls!
             await self.surveys_command(update, context)
             return
         
+        if data == "cmd_offers":
+            update.message = query.message
+            await self.offers_command(update, context)
+            return
+        
         if data == "cmd_support":
             keyboard = [
                 [InlineKeyboardButton("💰 Withdrawal", callback_data="support_withdrawal")],
@@ -1339,7 +1480,8 @@ Surveys are available through our offerwalls!
             self.application.add_handler(CommandHandler("referral", self.referral_command))
             self.application.add_handler(CommandHandler("leaderboard", self.leaderboard_command))
             self.application.add_handler(CommandHandler("offerwalls", self.offerwalls_command))
-            self.application.add_handler(CommandHandler("offers", self.offerwalls_command))  # Alias
+            self.application.add_handler(CommandHandler("walls", self.offerwalls_command))  # Alias
+            self.application.add_handler(CommandHandler("offers", self.offers_command))
             self.application.add_handler(CommandHandler("tasks", self.tasks_command))
             self.application.add_handler(CommandHandler("surveys", self.surveys_command))
             self.application.add_handler(CommandHandler("earn", self.offerwalls_command))  # Alias
