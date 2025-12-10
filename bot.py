@@ -313,7 +313,7 @@ class EarnQuestBot:
                     await asyncio.sleep(10)
                     try:
                         await warning.delete()
-                except:
+                    except:
                         pass
                 except Exception as e:
                     logger.error(f"❌ Failed to delete message: {e}")
