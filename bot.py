@@ -22,13 +22,13 @@ import asyncio
 import requests
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatPermissions, InputMediaPhoto, WebAppInfo
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatPermissions, InputMediaPhoto, WebAppInfo, BotCommand
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler, 
     ContextTypes, ConversationHandler, filters
 )
 from telegram.constants import ParseMode, ChatMemberStatus, ChatType
-from telegram.error import TelegramError
+from telegram.error import TelegramError, Conflict
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -200,11 +200,26 @@ class EarnQuestBot:
     async def fetch_mod_settings(self):
         """Fetch moderation settings from backend"""
         try:
-            response, error = self.api_request('GET', '/bot/settings/')
-            if response and response.status_code == 200:
+            # Make request with bot API key header
+            headers = {'Content-Type': 'application/json'}
+            if self.bot_api_key:
+                headers['X-Bot-Key'] = self.bot_api_key
+            
+            response = requests.get(
+                f"{self.api_base_url}/bot/settings/",
+                headers=headers,
+                timeout=15
+            )
+            
+            if response.status_code == 200:
                 settings = response.json()
+                logger.info(f"📥 Received settings from backend: {settings}")
                 self.mod_settings.update(settings)
-                logger.info("✅ Mod settings synced")
+                logger.info(f"✅ Mod settings synced: allow_links={self.mod_settings.get('allow_links')}, allow_forwards={self.mod_settings.get('allow_forwards')}")
+            elif response.status_code == 401:
+                logger.error(f"❌ Bot API key unauthorized. Check BOT_API_KEY env variable.")
+            else:
+                logger.warning(f"⚠️ Failed to fetch settings: {response.status_code} - {response.text}")
         except Exception as e:
             logger.error(f"Error fetching settings: {e}")
 
@@ -259,22 +274,29 @@ class EarnQuestBot:
         if chat.type not in [ChatType.GROUP, ChatType.SUPERGROUP]:
             return False
         
+        logger.info(f"🔍 Moderating message in chat {chat.id} from {user.username or user.first_name}")
+        logger.info(f"📋 Current mod_settings: allow_links={self.mod_settings.get('allow_links')}, allow_forwards={self.mod_settings.get('allow_forwards')}")
+        
         # Don't moderate admins
         try:
             member = await context.bot.get_chat_member(chat.id, user.id)
             if member.status in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]:
+                logger.info(f"⏭️ Skipping moderation for admin: {user.username}")
                 return False
-        except:
-            pass
+        except Exception as e:
+            logger.warning(f"Could not check member status: {e}")
         
         text = message.text or message.caption or ''
         
-        # Check for links
-        if not self.mod_settings.get('allow_links', False):
+        # Check for links (if not allowed)
+        allow_links = self.mod_settings.get('allow_links', False)
+        if not allow_links:
             url_pattern = r'(https?://|www\.|t\.me/|@\w+)'
             if re.search(url_pattern, text, re.IGNORECASE):
+                logger.info(f"🔗 Link detected in message from {user.username}: {text[:50]}...")
                 try:
                     await message.delete()
+                    logger.info(f"✅ Deleted message with link from {user.username}")
                     warning = await chat.send_message(
                         f"⚠️ @{user.username or user.first_name}, links are not allowed!",
                     )
@@ -289,15 +311,19 @@ class EarnQuestBot:
                     )
                     # Delete warning after 10 seconds
                     await asyncio.sleep(10)
-                    await warning.delete()
+                    try:
+                        await warning.delete()
                 except:
-                    pass
+                        pass
+                except Exception as e:
+                    logger.error(f"❌ Failed to delete message: {e}")
                 
                 await self.warn_user_internal(chat.id, user.id, context, "Posting links")
                 return True
         
         # Check for spam (too many messages)
         if await self.check_spam(user.id):
+            logger.info(f"🚨 Spam detected from {user.username}")
             try:
                 await message.delete()
                 await self.mute_user_internal(chat.id, user.id, context, 5)  # 5 min mute
@@ -313,16 +339,28 @@ class EarnQuestBot:
                     chat_id=chat.id,
                     description=f"Muted @{user.username or user.first_name} for 5 minutes (spam)"
                 )
-            except:
-                pass
+        except Exception as e:
+                logger.error(f"❌ Failed to handle spam: {e}")
             return True
         
         # Check for forwarded messages (if not allowed)
-        if message.forward_date and not self.mod_settings.get('allow_forwards', True):
+        allow_forwards = self.mod_settings.get('allow_forwards', True)
+        if message.forward_date and not allow_forwards:
+            logger.info(f"📤 Forwarded message detected from {user.username}")
             try:
                 await message.delete()
-            except:
-                pass
+                logger.info(f"✅ Deleted forwarded message from {user.username}")
+                # Log the deletion
+                await self.report_to_backend(
+                    event_type='message_deleted',
+                    data={'reason': 'Forwarded message not allowed'},
+                    telegram_user_id=user.id,
+                    telegram_username=user.username or user.first_name,
+                    chat_id=chat.id,
+                    description=f"Deleted forwarded message from @{user.username or user.first_name}"
+                )
+            except Exception as e:
+                logger.error(f"❌ Failed to delete forwarded message: {e}")
             return True
         
         return False
@@ -354,7 +392,7 @@ class EarnQuestBot:
         warnings = self.warned_users[user_id]
         
         if warnings >= 3:
-            await self.ban_user_internal(chat_id, user_id, context)
+            await self.ban_user_internal(chat_id, user_id, context, f"3 warnings - Last: {reason}")
             await context.bot.send_message(
                 chat_id,
                 f"🚫 User banned after 3 warnings!"
@@ -392,10 +430,45 @@ class EarnQuestBot:
         except Exception as e:
             logger.error(f"Failed to mute: {e}")
 
-    async def ban_user_internal(self, chat_id: int, user_id: int, context):
-        """Ban a user"""
+    async def ban_user_internal(self, chat_id: int, user_id: int, context, reason: str = "Multiple warnings"):
+        """Ban a user and save to database"""
         try:
+            # Get user info
+            try:
+                user = await context.bot.get_chat_member(chat_id, user_id)
+                username = user.user.username or user.user.first_name
+            except:
+                username = str(user_id)
+            
+            # Ban in Telegram
             await context.bot.ban_chat_member(chat_id, user_id)
+            logger.info(f"🚫 Banned user {username} (ID: {user_id}) from chat {chat_id}")
+            
+            # Save to database via API
+            try:
+                headers = {'Content-Type': 'application/json'}
+                if self.bot_api_key:
+                    headers['X-Bot-Key'] = self.bot_api_key
+                
+                response = requests.post(
+                    f"{self.api_base_url}/bot/banned-users/",
+                    json={
+                        'telegram_user_id': str(user_id),
+                        'telegram_username': username,
+                        'reason': reason,
+                        'banned_in_chat': str(chat_id)
+                    },
+                    headers=headers,
+                    timeout=15
+                )
+                
+                if response.status_code in [200, 201]:
+                    logger.info(f"✅ Saved banned user to database: {username}")
+                else:
+                    logger.warning(f"⚠️ Failed to save banned user: {response.status_code} - {response.text}")
+            except Exception as e:
+                logger.error(f"Error saving banned user to DB: {e}")
+                
         except Exception as e:
             logger.error(f"Failed to ban: {e}")
 
@@ -429,6 +502,36 @@ class EarnQuestBot:
         rules = self.mod_settings.get('rules_message', '📜 Be respectful!')
         rules = rules.replace('{website}', self.website_url)
         await update.message.reply_text(rules, parse_mode=ParseMode.MARKDOWN)
+
+    async def sync_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Manually sync settings from backend (admin only)"""
+        user = update.effective_user
+        chat = update.effective_chat
+        
+        # Check if user is admin (only in groups) or allow in private chat
+        if chat.type in [ChatType.GROUP, ChatType.SUPERGROUP]:
+            try:
+                member = await context.bot.get_chat_member(chat.id, user.id)
+                if member.status not in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]:
+                    await update.message.reply_text("⛔ Only admins can sync settings.")
+                    return
+            except:
+                pass
+        
+        msg = await update.message.reply_text("🔄 Syncing settings from backend...")
+        
+        await self.fetch_mod_settings()
+        
+        settings_summary = (
+            f"✅ **Settings Synced!**\n\n"
+            f"🔗 Allow Links: {'✅ Yes' if self.mod_settings.get('allow_links') else '❌ No'}\n"
+            f"📤 Allow Forwards: {'✅ Yes' if self.mod_settings.get('allow_forwards') else '❌ No'}\n"
+            f"🗑️ Auto-delete Links: {'✅ Yes' if self.mod_settings.get('auto_delete_links') else '❌ No'}\n"
+            f"📊 Max Msg/Min: {self.mod_settings.get('max_messages_per_minute', 5)}\n"
+            f"🔇 Mute Duration: {self.mod_settings.get('mute_duration_minutes', 30)} min"
+        )
+        
+        await msg.edit_text(settings_summary, parse_mode=ParseMode.MARKDOWN)
 
     # ==================== INTELLIGENT CHAT (GROUP) ====================
     
@@ -515,7 +618,7 @@ class EarnQuestBot:
         
         if chat.type in [ChatType.GROUP, ChatType.SUPERGROUP]:
             # Group - show brief info
-            await update.message.reply_text(
+                await update.message.reply_text(
                 f"🤖 **EarnQuest Bot**\n\n"
                 f"I'm here to help and keep this group clean!\n\n"
                 f"🌐 Start earning: {self.website_url}\n"
@@ -535,8 +638,7 @@ class EarnQuestBot:
                 "🎯 Open Offerwalls", 
                 web_app=WebAppInfo(url=f"{self.website_url}/offerwalls")
             )],
-            [InlineKeyboardButton("🎯 List Offerwalls", callback_data="cmd_offerwalls"),
-             InlineKeyboardButton("💵 Offers", callback_data="cmd_offers")],
+            [InlineKeyboardButton("🎯 List Offerwalls", callback_data="cmd_offerwalls")],
             [InlineKeyboardButton("📊 Surveys", callback_data="cmd_surveys"),
              InlineKeyboardButton("📝 Tasks", callback_data="cmd_tasks")],
             [InlineKeyboardButton("👥 Referral", callback_data="cmd_referral"),
@@ -560,7 +662,6 @@ Earn money by completing tasks, surveys, and offers!
 
 **Quick Commands:**
 /offerwalls - Browse all providers
-/offers - View available offers
 /surveys - Check available surveys
 /tasks - View available tasks
 /balance - Check your earnings
@@ -606,7 +707,7 @@ _Tap a button below to get started!_
         # Delete password message
         try:
             await update.message.delete()
-        except:
+                except:
             pass
         
         status_msg = await update.effective_chat.send_message("🔄 Logging in...")
@@ -618,7 +719,7 @@ _Tap a button below to get started!_
         
         if error:
             await status_msg.edit_text(f"❌ Connection error. Please try again later.")
-            context.user_data.clear()
+        context.user_data.clear()
             return ConversationHandler.END
         
         if response.status_code == 200:
@@ -653,7 +754,7 @@ _Tap a button below to get started!_
                 error_msg = 'Login failed'
             await status_msg.edit_text(f"❌ {error_msg}")
         
-        context.user_data.clear()
+            context.user_data.clear()
         return ConversationHandler.END
 
     async def register_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -717,7 +818,7 @@ _Tap a button below to get started!_
             return ConversationHandler.END
         
         if response.status_code == 201:
-            data = response.json()
+                data = response.json()
             
             # Log the registration event
             await self.report_to_backend(
@@ -735,7 +836,7 @@ _Tap a button below to get started!_
                 f"Use /login to access your account.",
                 parse_mode=ParseMode.MARKDOWN
             )
-        else:
+            else:
             try:
                 errors = response.json()
                 error_text = str(errors)
@@ -833,7 +934,7 @@ _Tap a button below to get started!_
             await update.message.reply_text("❌ Failed to fetch referral info.")
             return
         
-        data = response.json()
+                data = response.json()
         
         await update.message.reply_text(
             f"👥 **Your Referral Program**\n\n"
@@ -861,7 +962,7 @@ _Tap a button below to get started!_
             await update.message.reply_text("❌ Failed to fetch leaderboard.")
             return
         
-        data = response.json()
+                data = response.json()
         top = data.get('top_earners', [])[:10]
         
         medals = ['🥇', '🥈', '🥉'] + ['🏅'] * 7
@@ -1068,14 +1169,14 @@ _Tap a button below to get started!_
         token = self.get_user_token(user_id)
         
         if not token:
-            await update.message.reply_text(
+                    await update.message.reply_text(
                 "🔐 **Login Required**\n\n"
                 "Please /login to access surveys!\n\n"
                 f"Or visit: {self.website_url}/offerwalls",
                 parse_mode=ParseMode.MARKDOWN
-            )
-            return
-        
+                    )
+                    return
+                
         status_msg = await update.message.reply_text("🔄 Loading surveys with direct links...")
         
         # Fetch CPX Research iframe URL directly
@@ -1118,7 +1219,7 @@ _Tap a button below to get started!_
                 msg += f"\n_...and {len(surveys) - 5} more surveys!_\n"
             
             msg += f"\n💰 **Total Potential:** ${total_payout:.2f}\n"
-        else:
+            else:
             msg += "Survey data loading...\n"
             msg += "Tap the button below to browse available surveys!\n\n"
         
@@ -1149,8 +1250,7 @@ _Tap a button below to get started!_
             )])
         
         keyboard.append([
-            InlineKeyboardButton("🎯 All Offerwalls", callback_data="cmd_offerwalls"),
-            InlineKeyboardButton("💵 View Offers", callback_data="cmd_offers")
+            InlineKeyboardButton("🎯 All Offerwalls", callback_data="cmd_offerwalls")
         ])
         
         await status_msg.edit_text(
@@ -1159,118 +1259,8 @@ _Tap a button below to get started!_
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
 
-    async def offers_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Show available offers with direct links from multiple providers"""
-        user_id = update.effective_user.id
-        token = self.get_user_token(user_id)
-        
-        if not token:
-            await update.message.reply_text(
-                "🔐 **Login Required**\n\n"
-                "Please /login to view offers!\n\n"
-                f"Or visit: {self.website_url}/offerwalls",
-                parse_mode=ParseMode.MARKDOWN
-            )
-            return
-        
-        status_msg = await update.message.reply_text("🔄 Loading offers with direct links...")
-        
-        all_offers = []
-        providers_loaded = []
-        
-        # Fetch from multiple offer providers
-        offer_endpoints = [
-            ('lootably', '/lootably/offers/?limit=5'),
-            ('kiwiwall', '/kiwiwall/offers/?limit=5'),
-            ('adgate', '/adgate/offers/?limit=5'),
-            ('adgem', '/adgem/offers/?limit=5'),
-            ('ayet', '/ayet/offers/?limit=5'),
-            ('offertoro', '/offertoro/offers/?limit=5'),
-        ]
-        
-        for provider, endpoint in offer_endpoints:
-            try:
-                response, error = self.api_request('GET', endpoint, token=token)
-                if response and response.status_code == 200:
-                    data = response.json()
-                    offers = data.get('offers', data if isinstance(data, list) else [])
-                    for offer in offers[:4]:  # Max 4 per provider
-                        # Get direct offer URL - different offerwalls use different field names
-                        offer_url = (
-                            offer.get('url') or 
-                            offer.get('link') or 
-                            offer.get('offer_url') or 
-                            offer.get('tracking_url') or
-                            offer.get('click_url')
-                        )
-                        offer['direct_url'] = offer_url
-                        offer['provider'] = provider
-                        all_offers.append(offer)
-                    if offers:
-                        providers_loaded.append(self.OFFERWALL_NAMES.get(provider, provider))
-            except:
-                continue
-        
-        msg = "💰 **Top Paying Offers**\n\n"
-        
-        if all_offers:
-            msg += f"_From: {', '.join(providers_loaded[:3])}{'...' if len(providers_loaded) > 3 else ''}_\n"
-            msg += "_Your account is linked - tap to start!_\n\n"
-            
-            # Sort by payout (highest first)
-            all_offers.sort(key=lambda x: float(x.get('payout', x.get('amount', x.get('revenue', 0)))), reverse=True)
-            
-            keyboard = []
-            total_value = 0
-            
-            for i, offer in enumerate(all_offers[:8], 1):  # Top 8 offers
-                name = offer.get('name', offer.get('title', offer.get('offer_name', 'Offer')))
-                name_short = name[:30] + '...' if len(name) > 30 else name
-                payout = float(offer.get('payout', offer.get('amount', offer.get('revenue', 0))))
-                provider = self.OFFERWALL_NAMES.get(offer.get('provider', ''), offer.get('provider', ''))
-                direct_url = offer.get('direct_url')
-                total_value += payout
-                
-                msg += f"**{i}. {name_short}**\n"
-                msg += f"💵 ${payout:.2f} | 📦 {provider}\n\n"
-                
-                # Add WebApp button to open offer inside Telegram
-                if direct_url:
-                    btn_text = f"${payout:.2f} • {name[:18]}"
-                    # Use WebAppInfo to open in Telegram's in-app browser
-                    keyboard.append([InlineKeyboardButton(
-                        btn_text, 
-                        web_app=WebAppInfo(url=direct_url)
-                    )])
-            
-            msg += f"💰 **Total Potential:** ${total_value:.2f}\n"
-            msg += "\n_💡 Tap a button to open the offer!_"
-            
-            # Add browse all offerwalls as WebApp (opens in Telegram)
-            keyboard.append([InlineKeyboardButton(
-                "🎯 Browse All Offerwalls", 
-                web_app=WebAppInfo(url=f"{self.website_url}/offerwalls")
-            )])
-        else:
-            msg += "No individual offers loaded right now.\n\n"
-            msg += "Use the button below to browse all offerwalls!"
-            
-            keyboard = [
-                [InlineKeyboardButton(
-                    "🎯 Browse Offerwalls", 
-                    web_app=WebAppInfo(url=f"{self.website_url}/offerwalls")
-                )],
-            ]
-        
-        await status_msg.edit_text(
-            msg,
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            disable_web_page_preview=True
-        )
-
     # ==================== SUPPORT SYSTEM ====================
-    
+
     async def support_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Start support conversation"""
         if update.effective_chat.type != ChatType.PRIVATE:
@@ -1441,10 +1431,6 @@ _Tap a button below to get started!_
             await self.surveys_command(update, context)
             return
         
-        if data == "cmd_offers":
-            update.message = query.message
-            await self.offers_command(update, context)
-            return
         
         if data == "cmd_support":
             keyboard = [
@@ -1504,13 +1490,13 @@ _Tap a button below to get started!_
         await self.fetch_mod_settings()
 
     # ==================== SETUP ====================
-    
+
     def setup_handlers(self):
         """Setup all handlers"""
         if not self.token:
             logger.error("TELEGRAM_BOT_TOKEN not set!")
             return False
-        
+            
         try:
             self.application = Application.builder().token(self.token).build()
             
@@ -1570,12 +1556,12 @@ _Tap a button below to get started!_
             self.application.add_handler(CommandHandler("leaderboard", self.leaderboard_command))
             self.application.add_handler(CommandHandler("offerwalls", self.offerwalls_command))
             self.application.add_handler(CommandHandler("walls", self.offerwalls_command))  # Alias
-            self.application.add_handler(CommandHandler("offers", self.offers_command))
             self.application.add_handler(CommandHandler("tasks", self.tasks_command))
             self.application.add_handler(CommandHandler("surveys", self.surveys_command))
             self.application.add_handler(CommandHandler("earn", self.offerwalls_command))  # Alias
             self.application.add_handler(CommandHandler("faq", self.faq_command))
             self.application.add_handler(CommandHandler("rules", self.rules_command))
+            self.application.add_handler(CommandHandler("sync", self.sync_command))
             
             # Callback handler
             self.application.add_handler(CallbackQueryHandler(self.button_handler))
@@ -1611,10 +1597,17 @@ _Tap a button below to get started!_
             job_queue = self.application.job_queue
             if job_queue:
                 job_queue.run_repeating(self.scheduled_post_job, interval=60, first=10)  # Check every minute
-                job_queue.run_repeating(self.sync_settings_job, interval=300, first=5)  # Sync every 5 minutes
+                job_queue.run_repeating(self.sync_settings_job, interval=60, first=5)  # Sync every 1 minute
                 logger.info("✅ Job queue configured!")
             else:
                 logger.warning("⚠️ Job queue not available. Install with: pip install 'python-telegram-bot[job-queue]'")
+            
+            # Register commands with Telegram using post_init
+            async def post_init(application):
+                await self.register_commands()
+                await self.fetch_mod_settings()  # Sync settings on startup
+            
+            self.application.post_init = post_init
             
             logger.info("✅ Bot handlers configured!")
             return True
@@ -1622,6 +1615,32 @@ _Tap a button below to get started!_
         except Exception as e:
             logger.error(f"Setup failed: {e}")
             return False
+
+    async def register_commands(self):
+        """Register bot commands with Telegram so they show in the / menu"""
+        commands = [
+            BotCommand("start", "Main menu & help"),
+            BotCommand("login", "Login to your account"),
+            BotCommand("register", "Create a new account"),
+            BotCommand("balance", "Check your balance"),
+            BotCommand("stats", "View your statistics"),
+            BotCommand("offerwalls", "Browse all offerwalls"),
+            BotCommand("surveys", "View available surveys"),
+            BotCommand("tasks", "View available tasks"),
+            BotCommand("referral", "Get your referral link"),
+            BotCommand("leaderboard", "View top earners"),
+            BotCommand("support", "Get help & support"),
+            BotCommand("faq", "Frequently asked questions"),
+            BotCommand("rules", "View group rules"),
+            BotCommand("sync", "Sync settings (admin)"),
+            BotCommand("cancel", "Cancel current action"),
+        ]
+        
+        try:
+            await self.application.bot.set_my_commands(commands)
+            logger.info("✅ Bot commands registered with Telegram")
+        except Exception as e:
+            logger.error(f"Failed to register commands: {e}")
 
     async def clear_webhook_and_updates(self):
         """Clear webhook and pending updates before starting"""
@@ -1693,7 +1712,7 @@ if __name__ == "__main__":
     max_retries = 3
     for attempt in range(max_retries):
         try:
-            bot.run()
+    bot.run()
             break
         except Exception as e:
             if "Conflict" in str(e) and attempt < max_retries - 1:
