@@ -22,7 +22,7 @@ import asyncio
 import requests
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatPermissions, InputMediaPhoto
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatPermissions, InputMediaPhoto, WebAppInfo
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler, 
     ContextTypes, ConversationHandler, filters
@@ -524,13 +524,18 @@ class EarnQuestBot:
             )
             return
         
-        # Private chat - full menu
+        # Private chat - full menu with Web Apps for offerwalls
         keyboard = [
             [InlineKeyboardButton("🔐 Login", callback_data="start_login"),
              InlineKeyboardButton("📝 Register", callback_data="start_register")],
             [InlineKeyboardButton("💰 Balance", callback_data="cmd_balance"),
              InlineKeyboardButton("📊 Stats", callback_data="cmd_stats")],
-            [InlineKeyboardButton("🎯 Offerwalls", callback_data="cmd_offerwalls"),
+            # Open offerwalls directly in Telegram as Web App
+            [InlineKeyboardButton(
+                "🎯 Open Offerwalls", 
+                web_app=WebAppInfo(url=f"{self.website_url}/offerwalls")
+            )],
+            [InlineKeyboardButton("🎯 List Offerwalls", callback_data="cmd_offerwalls"),
              InlineKeyboardButton("💵 Offers", callback_data="cmd_offers")],
             [InlineKeyboardButton("📊 Surveys", callback_data="cmd_surveys"),
              InlineKeyboardButton("📝 Tasks", callback_data="cmd_tasks")],
@@ -887,9 +892,10 @@ _Tap a button below to get started!_
     }
 
     async def offerwalls_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Show available offerwalls with direct links"""
+        """Show available offerwalls as Telegram Web Apps (opens in-app)"""
         user_id = update.effective_user.id
         token = self.get_user_token(user_id)
+        session = self.user_sessions.get(user_id, {})
         
         if not token:
             await update.message.reply_text(
@@ -920,13 +926,21 @@ _Tap a button below to get started!_
             )
             return
         
-        # Filter to known offerwall services
+        # Filter to known offerwall services and fetch iframe URLs
         offerwalls = []
         for service in available_keys.keys():
             if service in self.OFFERWALL_NAMES:
+                # Fetch iframe URL for this service
+                iframe_response, iframe_error = self.api_request('GET', f'/services/{service}/iframe/', token=token)
+                iframe_url = None
+                if iframe_response and iframe_response.status_code == 200:
+                    iframe_data = iframe_response.json()
+                    iframe_url = iframe_data.get('iframe_url')
+                
                 offerwalls.append({
                     'service': service,
-                    'name': self.OFFERWALL_NAMES[service]
+                    'name': self.OFFERWALL_NAMES[service],
+                    'iframe_url': iframe_url
                 })
         
         if not offerwalls:
@@ -939,23 +953,35 @@ _Tap a button below to get started!_
         
         # Build message with offerwall list
         msg = "🎯 **Available Offerwalls**\n\n"
-        msg += "Complete offers & surveys to earn money!\n\n"
+        msg += "Tap a button to open the offerwall directly in Telegram!\n"
+        msg += "_Your account is linked - earnings auto-credited._\n\n"
         
         keyboard = []
         
         for wall in offerwalls[:12]:  # Limit to 12
             service = wall['service']
             name = wall['name']
+            iframe_url = wall.get('iframe_url')
+            
             msg += f"✅ **{name}**\n"
             
-            # Create direct link button to website offerwall page
-            wall_url = f"{self.website_url}/offerwalls?service={service}"
-            keyboard.append([InlineKeyboardButton(f"🎯 {name}", url=wall_url)])
+            # Use WebAppInfo to open iframe directly in Telegram (in-app browser)
+            if iframe_url:
+                # WebAppInfo opens as a Telegram Mini App (in-app web view)
+                keyboard.append([InlineKeyboardButton(
+                    f"🎯 {name}", 
+                    web_app=WebAppInfo(url=iframe_url)
+                )])
+            else:
+                # Fallback: Open frontend offerwall page as Web App
+                wall_url = f"{self.website_url}/offerwalls?service={service}"
+                keyboard.append([InlineKeyboardButton(
+                    f"🎯 {name}", 
+                    web_app=WebAppInfo(url=wall_url)
+                )])
         
-        msg += f"\n💡 _Tap a button to open the offerwall on our website!_"
-        
-        # Add main offerwalls page link
-        keyboard.append([InlineKeyboardButton("🌐 View All Offerwalls", url=f"{self.website_url}/offerwalls")])
+        msg += f"\n💡 _Opens inside Telegram - no external browser needed!_"
+        msg += f"\n💰 _Complete offers to earn money!_"
         
         await status_msg.edit_text(
             msg,
@@ -1037,7 +1063,7 @@ _Tap a button below to get started!_
         )
 
     async def surveys_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Show available surveys from CPX Research"""
+        """Show available surveys with direct iframe links"""
         user_id = update.effective_user.id
         token = self.get_user_token(user_id)
         
@@ -1050,9 +1076,23 @@ _Tap a button below to get started!_
             )
             return
         
-        status_msg = await update.message.reply_text("🔄 Loading surveys...")
+        status_msg = await update.message.reply_text("🔄 Loading surveys with direct links...")
         
-        # Fetch CPX Research surveys
+        # Fetch CPX Research iframe URL directly
+        cpx_iframe_url = None
+        iframe_response, iframe_error = self.api_request('GET', '/services/cpx/iframe/', token=token)
+        if iframe_response and iframe_response.status_code == 200:
+            iframe_data = iframe_response.json()
+            cpx_iframe_url = iframe_data.get('iframe_url')
+        
+        # Also try BitLabs surveys
+        bitlabs_iframe_url = None
+        bitlabs_response, _ = self.api_request('GET', '/services/bitlabs/iframe/', token=token)
+        if bitlabs_response and bitlabs_response.status_code == 200:
+            bitlabs_data = bitlabs_response.json()
+            bitlabs_iframe_url = bitlabs_data.get('iframe_url')
+        
+        # Fetch CPX Research survey list for display
         response, error = self.api_request('GET', '/cpx/surveys/', token=token)
         
         surveys = []
@@ -1061,6 +1101,7 @@ _Tap a button below to get started!_
             surveys = data.get('surveys', [])[:8]  # Limit to 8
         
         msg = "📊 **Available Surveys**\n\n"
+        msg += "_Your account is linked - tap to start surveys!_\n\n"
         
         if surveys:
             msg += f"Found **{len(surveys)}** surveys from CPX Research!\n\n"
@@ -1078,19 +1119,39 @@ _Tap a button below to get started!_
             
             msg += f"\n💰 **Total Potential:** ${total_payout:.2f}\n"
         else:
-            msg += "No surveys available right now.\n"
-            msg += "Surveys refresh frequently - check back soon!\n"
+            msg += "Survey data loading...\n"
+            msg += "Tap the button below to browse available surveys!\n\n"
         
         msg += "\n**Tips for Surveys:**\n"
         msg += "✅ Fill out your profile completely\n"
         msg += "✅ Be consistent with answers\n"
         msg += "✅ Use a desktop for best experience\n"
         
-        keyboard = [
-            [InlineKeyboardButton("📊 Take Surveys", url=f"{self.website_url}/offerwalls?service=cpx")],
-            [InlineKeyboardButton("🎯 All Offerwalls", callback_data="cmd_offerwalls"),
-             InlineKeyboardButton("💵 View Offers", callback_data="cmd_offers")],
-        ]
+        keyboard = []
+        
+        # Add WebApp buttons to open surveys inside Telegram
+        if cpx_iframe_url:
+            keyboard.append([InlineKeyboardButton(
+                "📊 Open CPX Surveys", 
+                web_app=WebAppInfo(url=cpx_iframe_url)
+            )])
+        if bitlabs_iframe_url:
+            keyboard.append([InlineKeyboardButton(
+                "📊 Open BitLabs Surveys", 
+                web_app=WebAppInfo(url=bitlabs_iframe_url)
+            )])
+        
+        # Fallback if no iframe URLs available
+        if not cpx_iframe_url and not bitlabs_iframe_url:
+            keyboard.append([InlineKeyboardButton(
+                "📊 Take Surveys", 
+                web_app=WebAppInfo(url=f"{self.website_url}/offerwalls?service=cpx")
+            )])
+        
+        keyboard.append([
+            InlineKeyboardButton("🎯 All Offerwalls", callback_data="cmd_offerwalls"),
+            InlineKeyboardButton("💵 View Offers", callback_data="cmd_offers")
+        ])
         
         await status_msg.edit_text(
             msg,
@@ -1099,7 +1160,7 @@ _Tap a button below to get started!_
         )
 
     async def offers_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Show available offers from multiple providers"""
+        """Show available offers with direct links from multiple providers"""
         user_id = update.effective_user.id
         token = self.get_user_token(user_id)
         
@@ -1112,18 +1173,19 @@ _Tap a button below to get started!_
             )
             return
         
-        status_msg = await update.message.reply_text("🔄 Loading offers from multiple providers...")
+        status_msg = await update.message.reply_text("🔄 Loading offers with direct links...")
         
         all_offers = []
         providers_loaded = []
         
         # Fetch from multiple offer providers
         offer_endpoints = [
+            ('lootably', '/lootably/offers/?limit=5'),
             ('kiwiwall', '/kiwiwall/offers/?limit=5'),
-            ('revtoo', '/revtoo/offers/?limit=5'),
+            ('adgate', '/adgate/offers/?limit=5'),
+            ('adgem', '/adgem/offers/?limit=5'),
             ('ayet', '/ayet/offers/?limit=5'),
-            ('primewall', '/primewall/offers/?limit=5'),
-            ('offery', '/offery/offers/?limit=5'),
+            ('offertoro', '/offertoro/offers/?limit=5'),
         ]
         
         for provider, endpoint in offer_endpoints:
@@ -1132,7 +1194,16 @@ _Tap a button below to get started!_
                 if response and response.status_code == 200:
                     data = response.json()
                     offers = data.get('offers', data if isinstance(data, list) else [])
-                    for offer in offers[:3]:  # Max 3 per provider
+                    for offer in offers[:4]:  # Max 4 per provider
+                        # Get direct offer URL - different offerwalls use different field names
+                        offer_url = (
+                            offer.get('url') or 
+                            offer.get('link') or 
+                            offer.get('offer_url') or 
+                            offer.get('tracking_url') or
+                            offer.get('click_url')
+                        )
+                        offer['direct_url'] = offer_url
                         offer['provider'] = provider
                         all_offers.append(offer)
                     if offers:
@@ -1140,44 +1211,62 @@ _Tap a button below to get started!_
             except:
                 continue
         
-        msg = "💰 **Available Offers**\n\n"
+        msg = "💰 **Top Paying Offers**\n\n"
         
         if all_offers:
-            msg += f"Loaded from: {', '.join(providers_loaded)}\n\n"
+            msg += f"_From: {', '.join(providers_loaded[:3])}{'...' if len(providers_loaded) > 3 else ''}_\n"
+            msg += "_Your account is linked - tap to start!_\n\n"
             
             # Sort by payout (highest first)
             all_offers.sort(key=lambda x: float(x.get('payout', x.get('amount', x.get('revenue', 0)))), reverse=True)
             
+            keyboard = []
             total_value = 0
-            for i, offer in enumerate(all_offers[:10], 1):
-                name = offer.get('name', offer.get('title', offer.get('offer_name', 'Offer')))[:35]
+            
+            for i, offer in enumerate(all_offers[:8], 1):  # Top 8 offers
+                name = offer.get('name', offer.get('title', offer.get('offer_name', 'Offer')))
+                name_short = name[:30] + '...' if len(name) > 30 else name
                 payout = float(offer.get('payout', offer.get('amount', offer.get('revenue', 0))))
                 provider = self.OFFERWALL_NAMES.get(offer.get('provider', ''), offer.get('provider', ''))
+                direct_url = offer.get('direct_url')
                 total_value += payout
                 
-                msg += f"{i}. **{name}**\n"
-                msg += f"   💵 ${payout:.2f} | 📦 {provider}\n"
+                msg += f"**{i}. {name_short}**\n"
+                msg += f"💵 ${payout:.2f} | 📦 {provider}\n\n"
+                
+                # Add WebApp button to open offer inside Telegram
+                if direct_url:
+                    btn_text = f"${payout:.2f} • {name[:18]}"
+                    # Use WebAppInfo to open in Telegram's in-app browser
+                    keyboard.append([InlineKeyboardButton(
+                        btn_text, 
+                        web_app=WebAppInfo(url=direct_url)
+                    )])
             
-            if len(all_offers) > 10:
-                msg += f"\n_...and {len(all_offers) - 10} more offers!_\n"
+            msg += f"💰 **Total Potential:** ${total_value:.2f}\n"
+            msg += "\n_💡 Tap a button to open the offer!_"
             
-            msg += f"\n💰 **Top 10 Value:** ${total_value:.2f}\n"
+            # Add browse all offerwalls as WebApp (opens in Telegram)
+            keyboard.append([InlineKeyboardButton(
+                "🎯 Browse All Offerwalls", 
+                web_app=WebAppInfo(url=f"{self.website_url}/offerwalls")
+            )])
         else:
-            msg += "No offers available right now.\n"
-            msg += "Check back soon for new earning opportunities!\n"
-        
-        msg += "\n💡 _Complete offers on our website to earn!_"
-        
-        keyboard = [
-            [InlineKeyboardButton("💰 View All Offers", url=f"{self.website_url}/offerwalls")],
-            [InlineKeyboardButton("📊 Surveys", callback_data="cmd_surveys"),
-             InlineKeyboardButton("🎯 Offerwalls", callback_data="cmd_offerwalls")],
-        ]
+            msg += "No individual offers loaded right now.\n\n"
+            msg += "Use the button below to browse all offerwalls!"
+            
+            keyboard = [
+                [InlineKeyboardButton(
+                    "🎯 Browse Offerwalls", 
+                    web_app=WebAppInfo(url=f"{self.website_url}/offerwalls")
+                )],
+            ]
         
         await status_msg.edit_text(
             msg,
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=InlineKeyboardMarkup(keyboard)
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            disable_web_page_preview=True
         )
 
     # ==================== SUPPORT SYSTEM ====================
