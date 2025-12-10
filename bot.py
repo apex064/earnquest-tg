@@ -81,15 +81,18 @@ class EarnQuestBot:
             'withdraw': "💰 **Withdrawals** are done on our website: {website}/withdraw\n\nMinimum varies by method. You need $1.00 in qualifying earnings (tasks/surveys - referral & faucet don't count).",
             'faucet': "🚿 **Faucet** lets you claim free rewards every few minutes!\n\nVisit: {website}/rewards",
             'referral': "👥 **Referral Program**\n\n• Earn 10% of all your referrals' earnings!\n• Both get $0.10 signup bonus\n\nGet your link: Use /referral or visit {website}/rewards",
-            'task': "📝 **Tasks** are available at {website}/tasks\n\nComplete tasks, submit proof, and earn money!",
-            'survey': "📊 **Surveys** are on our offerwalls: {website}/offerwalls\n\nMultiple providers = more opportunities!",
+            'task': "📝 **Tasks** are available at {website}/tasks\n\nComplete tasks, submit proof, and earn money!\n\nUse /tasks to see available tasks!",
+            'survey': "📊 **Surveys** are on our offerwalls: {website}/offerwalls\n\nMultiple providers = more opportunities!\n\nUse /surveys or /offerwalls to see options!",
+            'offerwall': "🎯 **Offerwalls** let you earn by:\n\n• Completing surveys\n• Downloading apps\n• Signing up for services\n• Watching videos\n\nUse /offerwalls to browse!\n\nVisit: {website}/offerwalls",
+            'offer': "🎯 **Offers & Surveys**\n\nEarn money completing offers on our offerwalls!\n\nUse /offerwalls to see all providers\nVisit: {website}/offerwalls",
             'payment': "💳 We support: PayPal, USDT, Litecoin, Skrill, and more!\n\nCheck methods at: {website}/withdraw",
             'help': "🆘 Need help?\n\n• Use /support in private chat\n• Email: {email}\n• Visit: {website}/help",
-            'earn': "💵 **Ways to Earn:**\n\n1. Complete tasks\n2. Do surveys\n3. Refer friends (10% commission!)\n4. Daily faucet claims\n5. Bonus codes\n\nStart at: {website}",
+            'earn': "💵 **Ways to Earn:**\n\n1. 🎯 Offerwalls - /offerwalls\n2. 📝 Tasks - /tasks\n3. 👥 Referrals - /referral\n4. 🚿 Faucet - {website}/rewards\n5. 🎁 Bonus codes\n\nStart at: {website}",
             'minimum': "📊 **Withdrawal Minimum**\n\nYou need $1.00 in qualifying earnings.\n\n⚠️ Referral & faucet earnings don't count!\nOnly tasks, surveys, and offerwalls count.",
             'balance': "💰 Check your balance:\n\n• Use /balance in private chat\n• Visit: {website}/dashboard",
             'login': "🔐 To login:\n\n• Use /login in private chat\n• Or visit: {website}/signin",
             'register': "📝 To register:\n\n• Use /register in private chat\n• Or visit: {website}/register",
+            'start': "🚀 **Getting Started:**\n\n1. /register or /login\n2. /offerwalls to earn\n3. /tasks for quick tasks\n4. /referral to invite friends\n5. /balance to check earnings",
         }
         
         logger.info(f"🔧 API: {self.api_base_url}")
@@ -457,6 +460,8 @@ class EarnQuestBot:
              InlineKeyboardButton("📝 Register", callback_data="start_register")],
             [InlineKeyboardButton("💰 Balance", callback_data="cmd_balance"),
              InlineKeyboardButton("📊 Stats", callback_data="cmd_stats")],
+            [InlineKeyboardButton("🎯 Offerwalls", callback_data="cmd_offerwalls"),
+             InlineKeyboardButton("📝 Tasks", callback_data="cmd_tasks")],
             [InlineKeyboardButton("👥 Referral", callback_data="cmd_referral"),
              InlineKeyboardButton("🏆 Leaderboard", callback_data="cmd_leaderboard")],
             [InlineKeyboardButton("🆘 Support", callback_data="cmd_support"),
@@ -469,15 +474,16 @@ class EarnQuestBot:
 
 Earn money by completing tasks, surveys, and offers!
 
-**Quick Actions:**
-• Login to check your balance
-• Get your referral link
-• Contact support
+**💰 Earning Options:**
+• 🎯 Offerwalls - Complete offers & surveys
+• 📝 Tasks - Simple tasks for quick cash
+• 👥 Referrals - Earn 10% from friends
 
-**Website Features:**
-💸 Withdrawals
-🚿 Faucet
-📝 Tasks & Surveys
+**Quick Commands:**
+/offerwalls - Browse earning opportunities  
+/tasks - View available tasks
+/balance - Check your earnings
+/referral - Get your referral link
 
 _Tap a button below to get started!_
 """
@@ -768,6 +774,187 @@ _Tap a button below to get started!_
         msg += f"\n🌐 {self.website_url}/leaderboard"
         await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
+    async def offerwalls_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show available offerwalls"""
+        user_id = update.effective_user.id
+        token = self.get_user_token(user_id)
+        
+        if not token:
+            await update.message.reply_text(
+                "🔐 **Login Required**\n\n"
+                "Please /login to access offerwalls and start earning!\n\n"
+                f"Or visit: {self.website_url}/offerwalls",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        
+        status_msg = await update.message.reply_text("🔄 Loading offerwalls...")
+        
+        response, error = self.api_request('GET', '/offerwalls/', token=token)
+        
+        if error or response.status_code != 200:
+            await status_msg.edit_text("❌ Failed to fetch offerwalls. Try again later.")
+            return
+        
+        data = response.json()
+        offerwalls = data if isinstance(data, list) else data.get('results', data.get('offerwalls', []))
+        
+        if not offerwalls:
+            await status_msg.edit_text(
+                "📭 **No Offerwalls Available**\n\n"
+                f"Check back later or visit: {self.website_url}/offerwalls",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        
+        # Build message with offerwall list
+        msg = "🎯 **Available Offerwalls**\n\n"
+        msg += "Complete offers & surveys to earn money!\n\n"
+        
+        keyboard = []
+        
+        for wall in offerwalls[:10]:  # Limit to 10
+            name = wall.get('name', wall.get('title', 'Unknown'))
+            provider = wall.get('provider', '')
+            status = "✅" if wall.get('is_active', True) else "⏸️"
+            
+            # Get iframe URL if available
+            iframe_url = wall.get('iframe_url', wall.get('url', ''))
+            wall_id = wall.get('id', '')
+            
+            msg += f"{status} **{name}**"
+            if provider:
+                msg += f" ({provider})"
+            msg += "\n"
+            
+            # Create direct link button
+            if wall_id:
+                # Link to offerwall page on website
+                wall_url = f"{self.website_url}/offerwalls?wall={wall_id}"
+                keyboard.append([InlineKeyboardButton(f"🎯 {name}", url=wall_url)])
+        
+        msg += f"\n💡 _Tip: Click a button below to start earning!_"
+        
+        # Add main offerwalls page link
+        keyboard.append([InlineKeyboardButton("🌐 View All Offerwalls", url=f"{self.website_url}/offerwalls")])
+        
+        await status_msg.edit_text(
+            msg,
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+    async def tasks_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show available tasks"""
+        user_id = update.effective_user.id
+        token = self.get_user_token(user_id)
+        
+        if not token:
+            await update.message.reply_text(
+                "🔐 **Login Required**\n\n"
+                "Please /login to view and complete tasks!\n\n"
+                f"Or visit: {self.website_url}/tasks",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        
+        status_msg = await update.message.reply_text("🔄 Loading tasks...")
+        
+        response, error = self.api_request('GET', '/tasks/', token=token)
+        
+        if error or response.status_code != 200:
+            await status_msg.edit_text("❌ Failed to fetch tasks. Try again later.")
+            return
+        
+        data = response.json()
+        tasks = data if isinstance(data, list) else data.get('results', data.get('tasks', []))
+        
+        if not tasks:
+            await status_msg.edit_text(
+                "📭 **No Tasks Available**\n\n"
+                "Check back later for new earning opportunities!\n\n"
+                f"🎯 Try offerwalls instead: /offerwalls\n"
+                f"🌐 {self.website_url}/tasks",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        
+        # Count and categorize tasks
+        total_tasks = len(tasks)
+        total_reward = sum(float(t.get('reward', t.get('amount', 0))) for t in tasks)
+        
+        msg = f"📝 **Available Tasks: {total_tasks}**\n\n"
+        msg += f"💰 Total Potential: ${total_reward:.2f}\n\n"
+        
+        # Show top 5 tasks
+        msg += "**Top Tasks:**\n"
+        for i, task in enumerate(tasks[:5], 1):
+            title = task.get('title', task.get('name', 'Task'))[:40]
+            reward = float(task.get('reward', task.get('amount', 0)))
+            category = task.get('category', {})
+            cat_name = category.get('name', '') if isinstance(category, dict) else str(category)
+            
+            msg += f"{i}. {title}\n"
+            msg += f"   💵 ${reward:.2f}"
+            if cat_name:
+                msg += f" | 📂 {cat_name}"
+            msg += "\n"
+        
+        if total_tasks > 5:
+            msg += f"\n_...and {total_tasks - 5} more tasks!_\n"
+        
+        msg += f"\n💡 _Complete tasks on our website to earn!_"
+        
+        keyboard = [
+            [InlineKeyboardButton("📝 View All Tasks", url=f"{self.website_url}/tasks")],
+            [InlineKeyboardButton("🎯 Offerwalls", callback_data="cmd_offerwalls"),
+             InlineKeyboardButton("💰 Balance", callback_data="cmd_balance")],
+        ]
+        
+        await status_msg.edit_text(
+            msg,
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+    async def surveys_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show survey info - directs to offerwalls"""
+        user_id = update.effective_user.id
+        token = self.get_user_token(user_id)
+        
+        msg = """📊 **Surveys on EarnQuest**
+
+Surveys are available through our offerwalls!
+
+**Popular Survey Providers:**
+• Bitlabs - High payouts
+• CPX Research - Many opportunities
+• Pollfish - Quick surveys
+• Theorem Reach - Regular surveys
+
+**Tips for Surveys:**
+✅ Fill out your profile completely
+✅ Be consistent with answers
+✅ Use a desktop for best experience
+✅ Check multiple providers
+
+"""
+        
+        keyboard = [
+            [InlineKeyboardButton("🎯 Go to Offerwalls", url=f"{self.website_url}/offerwalls")],
+        ]
+        
+        if token:
+            keyboard.insert(0, [InlineKeyboardButton("🎯 View Offerwalls", callback_data="cmd_offerwalls")])
+        else:
+            msg += "🔐 /login to access surveys!"
+        
+        await update.message.reply_text(
+            msg,
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
     # ==================== SUPPORT SYSTEM ====================
     
     async def support_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -859,12 +1046,14 @@ _Tap a button below to get started!_
     async def faq_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show FAQ"""
         keyboard = [
-            [InlineKeyboardButton("💰 Withdrawals", callback_data="faq_withdraw"),
-             InlineKeyboardButton("🚿 Faucet", callback_data="faq_faucet")],
-            [InlineKeyboardButton("👥 Referrals", callback_data="faq_referral"),
+            [InlineKeyboardButton("🎯 Offerwalls", callback_data="faq_offerwall"),
              InlineKeyboardButton("📝 Tasks", callback_data="faq_task")],
-            [InlineKeyboardButton("📊 Minimum", callback_data="faq_minimum"),
-             InlineKeyboardButton("💵 Earn", callback_data="faq_earn")],
+            [InlineKeyboardButton("💰 Withdrawals", callback_data="faq_withdraw"),
+             InlineKeyboardButton("📊 Minimum", callback_data="faq_minimum")],
+            [InlineKeyboardButton("👥 Referrals", callback_data="faq_referral"),
+             InlineKeyboardButton("🚿 Faucet", callback_data="faq_faucet")],
+            [InlineKeyboardButton("💵 How to Earn", callback_data="faq_earn"),
+             InlineKeyboardButton("🚀 Getting Started", callback_data="faq_start")],
         ]
         
         await update.message.reply_text(
@@ -911,6 +1100,21 @@ _Tap a button below to get started!_
         if data == "cmd_leaderboard":
             update.message = query.message
             await self.leaderboard_command(update, context)
+            return
+        
+        if data == "cmd_offerwalls":
+            update.message = query.message
+            await self.offerwalls_command(update, context)
+            return
+        
+        if data == "cmd_tasks":
+            update.message = query.message
+            await self.tasks_command(update, context)
+            return
+        
+        if data == "cmd_surveys":
+            update.message = query.message
+            await self.surveys_command(update, context)
             return
         
         if data == "cmd_support":
@@ -1035,6 +1239,11 @@ _Tap a button below to get started!_
             self.application.add_handler(CommandHandler("stats", self.stats_command))
             self.application.add_handler(CommandHandler("referral", self.referral_command))
             self.application.add_handler(CommandHandler("leaderboard", self.leaderboard_command))
+            self.application.add_handler(CommandHandler("offerwalls", self.offerwalls_command))
+            self.application.add_handler(CommandHandler("offers", self.offerwalls_command))  # Alias
+            self.application.add_handler(CommandHandler("tasks", self.tasks_command))
+            self.application.add_handler(CommandHandler("surveys", self.surveys_command))
+            self.application.add_handler(CommandHandler("earn", self.offerwalls_command))  # Alias
             self.application.add_handler(CommandHandler("faq", self.faq_command))
             self.application.add_handler(CommandHandler("rules", self.rules_command))
             
