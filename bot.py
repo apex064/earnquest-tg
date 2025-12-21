@@ -603,7 +603,7 @@ class EarnQuestBot:
                 chat_id=chat.id,
                 description=f"User unbanned by @{user.username or user.first_name}"
             )
-            
+                
         except Exception as e:
             logger.error(f"Failed to unban: {e}")
             await update.message.reply_text(f"❌ Failed to unban: {e}")
