@@ -1777,15 +1777,45 @@ _Tap a button below to get started!_
         
         logger.info("🤖 Starting EarnQuest Bot...")
         
-        # Run polling with error handling
+        # Use async method directly to avoid run_polling() internal attribute issues
         try:
-            self.application.run_polling(
-                allowed_updates=Update.ALL_TYPES,
-                drop_pending_updates=True,  # Drop any queued updates
-                close_loop=False
-            )
+            asyncio.run(self._run_async())
+        except KeyboardInterrupt:
+            logger.info("🛑 Bot stopped by user")
         except Exception as e:
-            logger.error(f"Bot stopped with error: {e}")
+            logger.error(f"Setup failed: {e}")
+    
+    async def _run_async(self):
+        """Run the bot asynchronously"""
+        try:
+            # Initialize and start the application
+            await self.application.initialize()
+            await self.application.start()
+            
+            # Start polling - v22.5 should handle this correctly
+            await self.application.updater.start_polling(
+                allowed_updates=Update.ALL_TYPES,
+                drop_pending_updates=True
+            )
+            
+            logger.info("✅ Bot is now running and listening for messages...")
+            
+            # Keep running until interrupted
+            try:
+                while True:
+                    await asyncio.sleep(3600)
+            except KeyboardInterrupt:
+                logger.info("🛑 Received shutdown signal")
+            finally:
+                # Shutdown gracefully
+                if updater.running:
+                    await updater.stop()
+                await self.application.stop()
+                await self.application.shutdown()
+                logger.info("✅ Bot shut down gracefully")
+        except Exception as e:
+            logger.error(f"Error running bot: {e}")
+            raise
 
 
 if __name__ == "__main__":
