@@ -1603,7 +1603,23 @@ _Tap a button below to get started!_
             return False
             
         try:
-            self.application = Application.builder().token(self.token).build()
+            # Build application - this may fail on older python-telegram-bot versions (<22.0)
+            # due to internal Updater attribute issues
+            try:
+                self.application = Application.builder().token(self.token).build()
+            except AttributeError as e:
+                if '_Updater__polling_cleanup_cb' in str(e):
+                    error_msg = (
+                        "❌ python-telegram-bot version incompatibility detected!\n"
+                        "This error occurs with versions 20.0-21.x due to an internal bug.\n"
+                        "Please upgrade to version 22.0 or higher:\n"
+                        "  pip3 install 'python-telegram-bot[job-queue]>=22.0' --user --break-system-packages\n"
+                        f"Current error: {e}"
+                    )
+                    logger.error(error_msg)
+                    raise RuntimeError("Please upgrade python-telegram-bot to >=22.0") from e
+                else:
+                    raise
             
             # Login conversation
             login_conv = ConversationHandler(
